@@ -182,6 +182,7 @@ async fn handle_chat_session(
 
     let mut stdin_lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut bench_receive_start: Option<(std::time::Instant, usize)> = None;
+    let mut ping_stats: Vec<u128> = Vec::new();
 
     loop {
         tokio::select! {
@@ -203,15 +204,13 @@ async fn handle_chat_session(
                             println!(" 통계 요약 : {}", format_stats_info(conn));
                             println!("------------------------------------------------------------");
                         } else if trimmed == "/ping" {
+                            ping_stats.clear();
                             println!(" ⏱️ [PING] 5회 왕복 지연시간 측정을 시작합니다...");
-                            for seq in 1..=5 {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_millis();
-                                let _ = framed_send.send(format!("__PING__:{}:{}", seq, now)).await;
-                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                            }
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis();
+                            let _ = framed_send.send(format!("__PING__:1:{}:5", now)).await;
                         } else if trimmed.starts_with("/bench") {
                             let parts: Vec<&str> = trimmed.split_whitespace().collect();
                             let mb: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(5).clamp(1, 50);
@@ -265,15 +264,35 @@ async fn handle_chat_session(
                         } else if msg.starts_with("__PONG__:") {
                             // PONG 응답 수신 시 RTT 계산 출력
                             let parts: Vec<&str> = msg.split(':').collect();
-                            if parts.len() >= 3 {
-                                let seq = parts[1];
-                                if let Ok(ts) = parts[2].parse::<u128>() {
-                                    let now = std::time::SystemTime::now()
+                            if parts.len() >= 4 {
+                                let seq: usize = parts[1].parse().unwrap_or(1);
+                                let ts: u128 = parts[2].parse().unwrap_or(0);
+                                let total: usize = parts[3].parse().unwrap_or(5);
+
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis();
+                                let rtt = now.saturating_sub(ts);
+                                ping_stats.push(rtt);
+                                println!(" 🎯 [Ping #{}/{}] RTT (지연시간): {} ms", seq, total, rtt);
+
+                                // 다음 PING 전송 (비동기 이벤트 루프 방해 없이 순차 진행)
+                                if seq < total {
+                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                    let next_now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap()
                                         .as_millis();
-                                    let rtt = now.saturating_sub(ts);
-                                    println!(" 🎯 [Ping #{}] RTT (지연시간): {} ms", seq, rtt);
+                                    let _ = framed_send.send(format!("__PING__:{}:{}:{}", seq + 1, next_now, total)).await;
+                                } else {
+                                    // 5회 완료 시 통계 출력
+                                    let min = ping_stats.iter().min().copied().unwrap_or(0);
+                                    let max = ping_stats.iter().max().copied().unwrap_or(0);
+                                    let avg: f64 = ping_stats.iter().sum::<u128>() as f64 / ping_stats.len() as f64;
+                                    println!("------------------------------------------------------------");
+                                    println!(" 📊 [PING 통계] 최소: {}ms | 최대: {}ms | 평균: {:.1}ms", min, max, avg);
+                                    println!("------------------------------------------------------------");
                                 }
                             }
                         } else if msg.starts_with("__BENCH_START__:") {
