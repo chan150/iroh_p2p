@@ -75,3 +75,25 @@ pub fn format_path_info(conn: &iroh::endpoint::Connection) -> String {
         format!("ℹ️ [경로 탐색 중] (상세: {})", paths_debug)
     }
 }
+
+/// QUIC 연결 통계(RTT, 송수신 바이트 수, 손실 패킷 등)를 반환합니다.
+pub fn format_stats_info(conn: &iroh::endpoint::Connection) -> String {
+    let stats = conn.stats();
+    let rtt_info = if let Some(path) = conn.paths().iter().next() {
+        conn.rtt(path.id())
+            .map(|rtt| format!("{:.2?}", rtt))
+            .unwrap_or_else(|| "측정 중".to_string())
+    } else {
+        "경로 없음".to_string()
+    };
+
+    format!(
+        "RTT(지연시간): {} | 송신: {:.2} KB ({} pkts) | 수신: {:.2} KB ({} pkts) | 손실: {} pkts",
+        rtt_info,
+        stats.udp_tx.bytes as f64 / 1024.0,
+        stats.udp_tx.datagrams,
+        stats.udp_rx.bytes as f64 / 1024.0,
+        stats.udp_rx.datagrams,
+        stats.lost_packets,
+    )
+}
