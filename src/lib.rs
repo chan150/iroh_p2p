@@ -63,3 +63,15 @@ pub async fn create_endpoint(alpns: Vec<Vec<u8>>) -> Result<Endpoint> {
 
     Ok(endpoint)
 }
+
+/// 현재 활성화된 네트워크 경로(Direct P2P vs Relay)를 사람이 읽기 쉬운 문자열로 변환합니다.
+pub fn format_path_info(conn: &iroh::endpoint::Connection) -> String {
+    let paths_debug = format!("{:?}", conn.paths());
+    if paths_debug.contains("ip:") {
+        format!("✅ [Direct P2P (직접 연결)] (상세: {})", paths_debug)
+    } else if paths_debug.contains("relay:") {
+        format!("🌐 [Relay (릴레이 경유)] (상세: {})", paths_debug)
+    } else {
+        format!("ℹ️ [경로 탐색 중] (상세: {})", paths_debug)
+    }
+}

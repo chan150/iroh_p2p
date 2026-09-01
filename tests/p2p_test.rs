@@ -26,6 +26,7 @@ async fn test_p2p_direct_or_relay_communication() -> Result<()> {
         let incoming = endpoint_a.accept().await.expect("Accept failed");
         let conn = incoming.await.expect("Handshake failed");
         println!("Peer A accepted conn from {:?}", conn.remote_id());
+        println!("Peer A connection paths: {:?}", conn.paths());
         let (mut send, mut recv) = conn.accept_bi().await.expect("Accept stream failed");
 
         // B로부터 메시지 수신

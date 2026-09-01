@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
-use iroh_p2p_example::{create_endpoint, decode_ticket, encode_ticket, CHAT_ALPN};
+use iroh_p2p_example::{create_endpoint, decode_ticket, encode_ticket, format_path_info, CHAT_ALPN};
 use tokio::io::AsyncBufReadExt;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
@@ -87,6 +87,7 @@ async fn run_listener() -> Result<()> {
 
         println!("\n [연결 성공!] 원격 피어와 연결되었습니다.");
         println!(" 원격 Node ID: {}", conn.remote_id());
+        println!(" 연결 경로 유형: {}", format_path_info(&conn));
 
         // 3. 스트림 수락 및 대화 시작
         let (send_stream, recv_stream) = match conn.accept_bi().await {
@@ -151,6 +152,7 @@ async fn run_connector(ticket_arg: Option<String>) -> Result<()> {
 
     println!("\n [연결 성공!] 원격 피어와 연결되었습니다.");
     println!(" 원격 Node ID: {}", conn.remote_id());
+    println!(" 연결 경로 유형: {}", format_path_info(&conn));
 
     // 3. 양방향 스트림 열기
     let (send_stream, recv_stream) = conn.open_bi().await.context("양방향 스트림 열기 실패")?;
