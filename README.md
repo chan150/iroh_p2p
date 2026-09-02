@@ -57,15 +57,30 @@ cargo run -- connect 1
 
 ---
 
-## ⚡ 실시간 성능 측정 및 진단 명령어
+## ⚡ 실시간 파일 전송 및 성능 진단 명령어
 
-통신 중 터미널에 아래 명령어를 입력하여 네트워크 품질을 즉시 측정할 수 있습니다:
+통신 중 터미널에 아래 명령어를 입력하여 파일 전송 및 네트워크 품질을 즉시 제어할 수 있습니다:
 
-* **`/ping`**: 5회 왕복 지연시간(RTT / Latency)을 비차단으로 측정하고 최소/최대/평균 지연시간 출력
+* **`/send <파일경로>`** (또는 `/file <파일경로>`): 대화 중 로컬 파일을 상대방에게 초고속 스트리밍 전송 (실시간 프로그레스 바 `[████░░░░] 45.2% (24.5 MB/s)` 표시, 수신 측 `received/` 폴더에 자동 저장)
+* **`/ping [횟수]`**: 왕복 지연시간(RTT) 측정 및 **레이턴시 정밀 분포도(p50, p90, p95, p99 백분위수, 지터, 아스키 히스토그램)** 출력 (예: `/ping 50`)
 * **`/bench [MB]`**: 지정한 크기(예: `/bench 10`, `/bench 50`)의 데이터를 고속 전송하여 **실제 전송 대역폭(`MB/s`, `Mbps`)** 실측
-* **`/stats`**: 현재 QUIC 연결 상태, 송수신 바이트/패킷 수, 패킷 손실 수 출력
+* **`/stats`**: 현재 QUIC 연결 상태, 직접 P2P 여부, 송수신 바이트/패킷 수, 패킷 손실 수 출력
 * **`/help`**: 명령어 목록 안내
 * **`/quit`**: 연결 종료
+
+---
+
+## 📁 단독 파일 전송 모드 (One-Click Send/Recv)
+
+대화 세션 없이 파일 전송만 빠르게 수행할 수도 있습니다:
+
+```bash
+# PC 1 (수신 대기):
+cargo run -- recv 0
+
+# PC 2 (파일 전송):
+cargo run -- send 0 "C:\path\to\large_archive.zip"
+```
 
 ---
 
@@ -74,6 +89,7 @@ cargo run -- connect 1
 ```bash
 cargo test -- --nocapture
 ```
+* `test_p2p_file_streaming_transfer`: P2P 파일 스트리밍 전송 및 100% 무결성 검증
 * `test_channel_zero_config_connection`: 티켓 없는 채널 기반 자동 P2P 연결 검증
 * `test_p2p_direct_or_relay_communication`: E2E P2P 데이터 통신 검증
 * `test_p2p_reconnection_loop`: 다중 세션 및 연속 재접속 검증
@@ -83,7 +99,8 @@ cargo test -- --nocapture
 
 ## 📂 프로젝트 구조
 
-- `src/lib.rs`: 결정론적 채널 키 생성 (`derive_channel_keys`), 엔드포인트 생성 (`create_endpoint_with_secret_key`), 티켓 인코딩/디코딩, 네트워크 통계 포맷팅
-- `src/main.rs`: 채널 기반 Zero-Config CLI 및 실시간 비동기 P2P 채팅 & 대역폭/지연시간 벤치마크 루프
-- `tests/p2p_test.rs`: 무인 자동화 E2E 통합 테스트
+- `src/lib.rs`: 고속 파일 스트리밍 송수신 (`send_file_stream`, `receive_file_stream`), 레이턴시 분포 계산 (`analyze_ping_distribution`), 결정론적 채널 키 생성 (`derive_channel_keys`), 엔드포인트 생성, 통계 포맷팅
+- `src/main.rs`: 파일 전송/수신 전용 모드 및 대화 중 백그라운드 파일 전송 핸들러가 내장된 CLI
+- `iroh.dart`: Flutter / Dart 애플리케이션용 P2P 파일 전송, 실시간 메시징, 레이턴시 통계 클라이언트
+- `tests/p2p_test.rs`: 5개 시나리오 무인 자동화 E2E 통합 테스트
 

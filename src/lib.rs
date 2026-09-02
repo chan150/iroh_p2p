@@ -263,3 +263,163 @@ pub fn format_ping_distribution_report(stats: &PingDistributionStats) -> String 
     out.push_str("============================================================");
     out
 }
+
+async fn read_exact_stream(recv: &mut iroh::endpoint::RecvStream, buf: &mut [u8]) -> Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match recv.read(&mut buf[filled..]).await.context("스트림 읽기 실패")? {
+            Some(0) | None => anyhow::bail!("스트림이 예기치 않게 종료되었습니다."),
+            Some(n) => filled += n,
+        }
+    }
+    Ok(())
+}
+
+/// 스트림을 통해 지정된 로컬 파일을 원격 피어에게 초고속 스트리밍 전송합니다.
+pub async fn send_file_stream<F>(
+    mut send_stream: iroh::endpoint::SendStream,
+    mut recv_stream: iroh::endpoint::RecvStream,
+    file_path: &std::path::Path,
+    mut progress_callback: F,
+) -> Result<(String, u64, std::time::Duration)>
+where
+    F: FnMut(u64, u64, f64), // (전송된 바이트, 총 바이트, 속도 MB/s)
+{
+    use tokio::io::AsyncReadExt;
+
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("올바른 파일 이름을 찾을 수 없습니다.")?;
+    let mut file = tokio::fs::File::open(file_path)
+        .await
+        .context("파일 열기 실패")?;
+    let metadata = file.metadata().await.context("파일 메타데이터 조회 실패")?;
+    let file_size = metadata.len();
+
+    // 1. 헤더 전송: [매직 4바이트 ("FILE")] [파일명길이 2바이트 (u16)] [파일명 바이트] [파일크기 8바이트 (u64)]
+    let name_bytes = file_name.as_bytes();
+    let name_len = name_bytes.len() as u16;
+
+    let mut header = Vec::with_capacity(4 + 2 + name_bytes.len() + 8);
+    header.extend_from_slice(b"FILE");
+    header.extend_from_slice(&name_len.to_le_bytes());
+    header.extend_from_slice(name_bytes);
+    header.extend_from_slice(&file_size.to_le_bytes());
+
+    send_stream.write_all(&header).await.context("파일 헤더 전송 실패")?;
+
+    // 2. 파일 데이터 청크 스트리밍 (128KB 버퍼)
+    let start_time = std::time::Instant::now();
+    let mut buffer = vec![0u8; 128 * 1024];
+    let mut sent_bytes = 0u64;
+
+    while sent_bytes < file_size {
+        let n = file.read(&mut buffer).await.context("파일 읽기 실패")?;
+        if n == 0 {
+            break;
+        }
+        send_stream.write_all(&buffer[..n]).await.context("파일 청크 전송 실패")?;
+        sent_bytes += n as u64;
+
+        let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+        let speed_mbs = (sent_bytes as f64 / (1024.0 * 1024.0)) / elapsed;
+        progress_callback(sent_bytes, file_size, speed_mbs);
+    }
+
+    send_stream.finish().context("스트림 종료 알림 실패")?;
+
+    // 3. 상대방의 수신 완료 ACK 확인 (2바이트 "OK")
+    let mut ack = [0u8; 2];
+    read_exact_stream(&mut recv_stream, &mut ack).await.context("수신 확인 ACK 대기 실패")?;
+    if &ack != b"OK" {
+        anyhow::bail!("상대방이 비정상 응답을 반환했습니다.");
+    }
+
+    Ok((file_name.to_string(), file_size, start_time.elapsed()))
+}
+
+/// 수신 스트림으로부터 파일을 받아 `save_dir` 디렉터리에 저장합니다.
+pub async fn receive_file_stream<F>(
+    mut send_stream: iroh::endpoint::SendStream,
+    mut recv_stream: iroh::endpoint::RecvStream,
+    save_dir: &std::path::Path,
+    mut progress_callback: F,
+) -> Result<(std::path::PathBuf, u64, std::time::Duration)>
+where
+    F: FnMut(u64, u64, f64),
+{
+    use tokio::io::AsyncWriteExt;
+
+    // 1. 헤더 파싱
+    let mut magic = [0u8; 4];
+    read_exact_stream(&mut recv_stream, &mut magic).await.context("매직 바이트 읽기 실패")?;
+    if &magic != b"FILE" {
+        anyhow::bail!("파일 전송 프로토콜 형식이 아닙니다.");
+    }
+
+    let mut name_len_buf = [0u8; 2];
+    read_exact_stream(&mut recv_stream, &mut name_len_buf).await.context("파일명 길이 읽기 실패")?;
+    let name_len = u16::from_le_bytes(name_len_buf) as usize;
+
+    let mut name_buf = vec![0u8; name_len];
+    read_exact_stream(&mut recv_stream, &mut name_buf).await.context("파일명 읽기 실패")?;
+    let raw_name = String::from_utf8(name_buf).context("파일명 UTF-8 디코딩 실패")?;
+    let file_name = std::path::Path::new(&raw_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("received_file.bin");
+
+    let mut size_buf = [0u8; 8];
+    read_exact_stream(&mut recv_stream, &mut size_buf).await.context("파일 크기 읽기 실패")?;
+    let file_size = u64::from_le_bytes(size_buf);
+
+    // 2. 저장 경로 결정 (디렉터리 생성 및 중복 파일명 처리)
+    tokio::fs::create_dir_all(save_dir).await.context("저장 디렉터리 생성 실패")?;
+    let mut save_path = save_dir.join(file_name);
+    let mut counter = 1;
+    while save_path.exists() {
+        let stem = std::path::Path::new(file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
+        let ext = std::path::Path::new(file_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{}", e))
+            .unwrap_or_default();
+        save_path = save_dir.join(format!("{}({}){}", stem, counter, ext));
+        counter += 1;
+    }
+
+    let mut out_file = tokio::fs::File::create(&save_path).await.context("저장용 파일 생성 실패")?;
+
+    // 3. 파일 바이너리 스트림 수신 (128KB 버퍼)
+    let start_time = std::time::Instant::now();
+    let mut buffer = vec![0u8; 128 * 1024];
+    let mut received_bytes = 0u64;
+
+    while received_bytes < file_size {
+        let remaining = (file_size - received_bytes) as usize;
+        let to_read = buffer.len().min(remaining);
+        let n = match recv_stream.read(&mut buffer[..to_read]).await.context("파일 데이터 수신 실패")? {
+            Some(0) | None => break,
+            Some(n) => n,
+        };
+        out_file.write_all(&buffer[..n]).await.context("로컬 파일 쓰기 실패")?;
+        received_bytes += n as u64;
+
+        let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+        let speed_mbs = (received_bytes as f64 / (1024.0 * 1024.0)) / elapsed;
+        progress_callback(received_bytes, file_size, speed_mbs);
+    }
+
+    out_file.flush().await.context("파일 플러시 실패")?;
+
+    // 4. 완료 ACK 회신
+    send_stream.write_all(b"OK").await.context("ACK 전송 실패")?;
+    send_stream.finish().context("ACK 스트림 종료 실패")?;
+
+    Ok((save_path, received_bytes, start_time.elapsed()))
+}
+

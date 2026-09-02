@@ -1,4 +1,5 @@
 ﻿import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 /// Iroh P2P 연결 상태 및 이벤트 모델
@@ -126,6 +127,68 @@ class IrohBenchReportEvent extends IrohEvent {
       'IrohBenchReportEvent(${isSender ? "송신" : "수신"}: ${megabytes.toStringAsFixed(2)}MB in ${seconds.toStringAsFixed(2)}s -> ${speedMbs.toStringAsFixed(2)} MB/s (${speedMbps.toStringAsFixed(2)} Mbps))';
 }
 
+/// 파일 전송 진행률 이벤트
+class IrohFileProgressEvent extends IrohEvent {
+  final String fileName;
+  final int currentBytes;
+  final int totalBytes;
+  final double percentage;
+  final double speedMbs;
+  final bool isSending; // true: 내가 전송 중, false: 상대방 파일 수신 중
+
+  IrohFileProgressEvent({
+    required this.fileName,
+    required this.currentBytes,
+    required this.totalBytes,
+    required this.speedMbs,
+    required this.isSending,
+  }) : percentage = totalBytes > 0 ? (currentBytes / totalBytes) * 100.0 : 0.0;
+
+  @override
+  String toString() =>
+      'IrohFileProgressEvent(${isSending ? "송신" : "수신"}: $fileName, ${(currentBytes / 1048576).toStringAsFixed(2)}MB / ${(totalBytes / 1048576).toStringAsFixed(2)}MB (${percentage.toStringAsFixed(1)}%) - ${speedMbs.toStringAsFixed(2)} MB/s)';
+}
+
+/// 파일 전송 완료 이벤트
+class IrohFileSentEvent extends IrohEvent {
+  final String fileName;
+  final int totalBytes;
+  final double seconds;
+  final double speedMbs;
+
+  IrohFileSentEvent({
+    required this.fileName,
+    required this.totalBytes,
+    required this.seconds,
+    required this.speedMbs,
+  });
+
+  @override
+  String toString() =>
+      'IrohFileSentEvent($fileName, ${(totalBytes / 1048576).toStringAsFixed(2)}MB in ${seconds.toStringAsFixed(2)}s @ ${speedMbs.toStringAsFixed(2)} MB/s)';
+}
+
+/// 파일 수신 완료 이벤트
+class IrohFileReceivedEvent extends IrohEvent {
+  final String fileName;
+  final String savedPath;
+  final int totalBytes;
+  final double seconds;
+  final double speedMbs;
+
+  IrohFileReceivedEvent({
+    required this.fileName,
+    required this.savedPath,
+    required this.totalBytes,
+    required this.seconds,
+    required this.speedMbs,
+  });
+
+  @override
+  String toString() =>
+      'IrohFileReceivedEvent(saved: $savedPath, ${(totalBytes / 1048576).toStringAsFixed(2)}MB in ${seconds.toStringAsFixed(2)}s @ ${speedMbs.toStringAsFixed(2)} MB/s)';
+}
+
 /// 연결 종료 이벤트
 class IrohDisconnectedEvent extends IrohEvent {
   final String reason;
@@ -153,6 +216,7 @@ abstract class IrohP2PClient {
   Future<String> startHost({int channel = 0});
   Future<void> connect({int? channel, String? ticket});
   Future<void> sendMessage(String message);
+  Future<void> sendFile(String filePath);
   Future<void> ping({int count = 20});
   Future<void> bench({int megabytes = 5});
   Future<void> disconnect();
@@ -208,6 +272,17 @@ class IrohP2PController implements IrohP2PClient {
     final trimmed = message.trim();
     if (trimmed.isEmpty) return;
     await _sendRaw(trimmed);
+  }
+
+  @override
+  Future<void> sendFile(String filePath) async {
+    final file = File(filePath);
+    if (!await file.exists()) {
+      _eventController.add(IrohErrorEvent('전송할 파일이 존재하지 않습니다: $filePath'));
+      return;
+    }
+    // 콘솔/브릿지 명령 전송
+    await _sendRaw('/send $filePath');
   }
 
   @override
@@ -283,7 +358,6 @@ class IrohP2PController implements IrohP2PClient {
             _sendRaw('__PING__:${seq + 1}:$nextNow:$total');
           });
         } else {
-          // 다중 측정 완료 -> 분포 분석 리포트 생성
           final report = _calculateDistributionReport(total);
           if (report != null) {
             _eventController.add(report);
@@ -328,6 +402,46 @@ class IrohP2PController implements IrohP2PClient {
           isSender: false,
         ));
       }
+    } else if (raw.startsWith('__FILE_PROGRESS__:')) {
+      // __FILE_PROGRESS__:<filename>:<current>:<total>:<speed_mbs>:<is_sending>
+      final parts = raw.split(':');
+      if (parts.length >= 6) {
+        final name = parts[1];
+        final current = int.tryParse(parts[2]) ?? 0;
+        final total = int.tryParse(parts[3]) ?? 0;
+        final speed = double.tryParse(parts[4]) ?? 0.0;
+        final isSending = parts[5] == '1' || parts[5] == 'true';
+        _eventController.add(IrohFileProgressEvent(
+          fileName: name,
+          currentBytes: current,
+          totalBytes: total,
+          speedMbs: speed,
+          isSending: isSending,
+        ));
+      }
+    } else if (raw.startsWith('__FILE_RECEIVED__:')) {
+      // __FILE_RECEIVED__:<filename>:<saved_path>:<bytes>:<sec>:<speed_mbs>
+      final parts = raw.split(':');
+      if (parts.length >= 6) {
+        _eventController.add(IrohFileReceivedEvent(
+          fileName: parts[1],
+          savedPath: parts[2],
+          totalBytes: int.tryParse(parts[3]) ?? 0,
+          seconds: double.tryParse(parts[4]) ?? 0.0,
+          speedMbs: double.tryParse(parts[5]) ?? 0.0,
+        ));
+      }
+    } else if (raw.startsWith('__FILE_SENT__:')) {
+      // __FILE_SENT__:<filename>:<bytes>:<sec>:<speed_mbs>
+      final parts = raw.split(':');
+      if (parts.length >= 5) {
+        _eventController.add(IrohFileSentEvent(
+          fileName: parts[1],
+          totalBytes: int.tryParse(parts[2]) ?? 0,
+          seconds: double.tryParse(parts[3]) ?? 0.0,
+          speedMbs: double.tryParse(parts[4]) ?? 0.0,
+        ));
+      }
     } else if (raw.startsWith('__CONNECTED__:')) {
       final parts = raw.split(':');
       _isConnected = true;
@@ -354,12 +468,10 @@ class IrohP2PController implements IrohP2PClient {
     final sum = sorted.reduce((a, b) => a + b);
     final avgMs = sum / n;
 
-    // 분산 / 표준편차
     final variance =
         sorted.map((x) => pow(x - avgMs, 2)).reduce((a, b) => a + b) / n;
     final stdDevMs = sqrt(variance);
 
-    // 지터
     double jitterMs = 0.0;
     if (n > 1) {
       int diffSum = 0;
@@ -369,7 +481,6 @@ class IrohP2PController implements IrohP2PClient {
       jitterMs = diffSum / (n - 1);
     }
 
-    // 백분위수
     final p50Ms = sorted[(n * 0.50).clamp(0, n - 1).toInt()];
     final p90Ms = sorted[(n * 0.90).clamp(0, n - 1).toInt()];
     final p95Ms = sorted[(n * 0.95).clamp(0, n - 1).toInt()];
@@ -378,7 +489,6 @@ class IrohP2PController implements IrohP2PClient {
     final lossRate =
         totalSent > 0 ? ((totalSent - n) / totalSent) * 100.0 : 0.0;
 
-    // 히스토그램 버킷 생성 (5개 구간)
     final numBuckets = min(5, max(1, maxMs - minMs + 1));
     final step = max(1, ((maxMs - minMs) / numBuckets).ceil());
     final List<IrohLatencyBucket> buckets = [];

@@ -217,3 +217,79 @@ async fn test_channel_zero_config_connection() -> Result<()> {
     println!("Zero-config channel #7 test passed successfully!");
     Ok(())
 }
+
+#[tokio::test]
+async fn test_p2p_file_streaming_transfer() -> Result<()> {
+    use iroh_p2p_example::{create_endpoint_with_secret_key, derive_channel_keys, receive_file_stream, send_file_stream};
+
+    let test_dir = std::env::temp_dir().join("iroh_file_test_dir");
+    let save_dir = test_dir.join("received");
+    tokio::fs::create_dir_all(&test_dir).await?;
+
+    // 1. 2MB 테스트 파일 생성
+    let source_file_path = test_dir.join("sample_test_doc.bin");
+    let test_payload = vec![0xABu8; 2 * 1024 * 1024]; // 2MB
+    tokio::fs::write(&source_file_path, &test_payload).await?;
+
+    let channel_num = 12u32;
+    let (secret_key, target_addr) = derive_channel_keys(channel_num);
+
+    let host_endpoint = create_endpoint_with_secret_key(Some(secret_key), vec![CHAT_ALPN.to_vec()]).await?;
+    let save_dir_clone = save_dir.clone();
+
+    // Host: 파일 수신 대기
+    let host_handle = tokio::spawn(async move {
+        let incoming = host_endpoint.accept().await.expect("Host accept failed");
+        let conn = incoming.await.expect("Host handshake failed");
+        let (send, recv) = conn.accept_bi().await.expect("Host accept bi stream failed");
+
+        let (received_path, received_bytes, duration) = receive_file_stream(
+            send,
+            recv,
+            &save_dir_clone,
+            |_cur, _tot, _spd| {},
+        )
+        .await
+        .expect("Host receive_file_stream failed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        host_endpoint.close().await;
+
+        (received_path, received_bytes, duration)
+    });
+
+    // Client: 파일 전송
+    let client_endpoint = create_endpoint(vec![]).await?;
+    let conn = client_endpoint.connect(target_addr, CHAT_ALPN).await.expect("Client connect failed");
+    let (send, recv) = conn.open_bi().await.expect("Client open bi stream failed");
+
+    let (sent_name, sent_bytes, sent_dur) = send_file_stream(
+        send,
+        recv,
+        &source_file_path,
+        |_cur, _tot, _spd| {},
+    )
+    .await
+    .expect("Client send_file_stream failed");
+
+    assert_eq!(sent_name, "sample_test_doc.bin");
+    assert_eq!(sent_bytes, 2 * 1024 * 1024);
+
+    let (saved_path, recv_bytes, _) = host_handle.await.expect("Host panic");
+    assert_eq!(recv_bytes, 2 * 1024 * 1024);
+
+    // 수신 파일 내용 검증
+    let received_content = tokio::fs::read(&saved_path).await?;
+    assert_eq!(received_content, test_payload);
+
+    client_endpoint.close().await;
+
+    // 임시 파일 정리
+    let _ = tokio::fs::remove_dir_all(&test_dir).await;
+
+    println!(
+        "P2P File Transfer Test (2MB in {:.2}s) passed with 100% integrity!",
+        sent_dur.as_secs_f64()
+    );
+    Ok(())
+}
