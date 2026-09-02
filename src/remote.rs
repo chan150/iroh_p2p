@@ -4,7 +4,6 @@ use image::{ColorType, ImageEncoder};
 use screenshots::Screen;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 
 /// 원격 제어 마우스/키보드 명령 프로토콜
 #[derive(Debug, Clone, PartialEq)]
