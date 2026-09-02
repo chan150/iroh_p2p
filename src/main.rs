@@ -3,8 +3,9 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use iroh_p2p_example::{
     analyze_ping_distribution, create_endpoint, create_endpoint_with_secret_key, decode_ticket,
-    derive_channel_keys, encode_ticket, format_path_info, format_ping_distribution_report,
-    format_stats_info, receive_file_stream, send_file_stream, CHAT_ALPN,
+    derive_channel_keys, dispatch_incoming_bi_stream, encode_ticket, format_path_info,
+    format_ping_distribution_report, format_stats_info, send_benchmark_stream,
+    send_file_stream, IncomingStreamResult, CHAT_ALPN,
 };
 use std::io::Write;
 use tokio::io::AsyncBufReadExt;
@@ -279,7 +280,7 @@ async fn run_file_receiver(channel: u32, save_dir_opt: Option<std::path::PathBuf
         while let Ok((send_stream, recv_stream)) = conn.accept_bi().await {
             let save_dir_clone = save_dir.clone();
             tokio::spawn(async move {
-                match receive_file_stream(
+                match dispatch_incoming_bi_stream(
                     send_stream,
                     recv_stream,
                     &save_dir_clone,
@@ -289,17 +290,24 @@ async fn run_file_receiver(channel: u32, save_dir_opt: Option<std::path::PathBuf
                 )
                 .await
                 {
-                    Ok((path, size, elapsed)) => {
+                    Ok(IncomingStreamResult::File { path, size, duration }) => {
                         println!("\n------------------------------------------------------------");
-                        let speed_mbs = (size as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64().max(0.001);
+                        let speed_mbs = (size as f64 / (1024.0 * 1024.0)) / duration.as_secs_f64().max(0.001);
                         println!(" ✅ [파일 수신 완료!]");
                         println!("  • 저장 경로 : {:?}", path);
                         println!("  • 크기      : {:.2} MB", size as f64 / (1024.0 * 1024.0));
-                        println!("  • 소요 시간 : {:.2}초 ({:.2} MB/s)", elapsed.as_secs_f64(), speed_mbs);
+                        println!("  • 소요 시간 : {:.2}초 ({:.2} MB/s)", duration.as_secs_f64(), speed_mbs);
+                        println!("------------------------------------------------------------\n");
+                    }
+                    Ok(IncomingStreamResult::Benchmark { megabytes, duration, speed_mbs }) => {
+                        println!("\n------------------------------------------------------------");
+                        println!(" ✅ [바이너리 벤치마크 수신 완료]");
+                        println!("  • 전송량    : {:.2} MB | 소요 시간: {:.2}초", megabytes, duration.as_secs_f64());
+                        println!("  • ⚡ 대역폭 : {:.2} MB/s ({:.2} Mbps)", speed_mbs, speed_mbs * 8.0);
                         println!("------------------------------------------------------------\n");
                     }
                     Err(e) => {
-                        eprintln!("\n [오류] 파일 수신 실패: {:?}", e);
+                        eprintln!("\n [오류] 스트림 처리 실패: {:?}", e);
                     }
                 }
             });
@@ -341,13 +349,12 @@ async fn handle_chat_session(
     let mut bench_receive_start: Option<(std::time::Instant, usize)> = None;
     let mut ping_stats: Vec<u128> = Vec::new();
 
-    // 백그라운드 파일 수신 태스크: 채팅 중에 상대방이 /send 로 파일을 전송하면 자동으로 수신
+    // 백그라운드 스트림 수신 태스크: 파일 전송 및 고속 바이너리 벤치마크 자동 디스패치
     let conn_clone = conn.clone();
     tokio::spawn(async move {
         while let Ok((send, recv)) = conn_clone.accept_bi().await {
             tokio::spawn(async move {
-                println!("\n 📥 [알림] 상대방으로부터 파일 수신을 시작합니다...");
-                match receive_file_stream(
+                match dispatch_incoming_bi_stream(
                     send,
                     recv,
                     std::path::Path::new("received"),
@@ -357,17 +364,25 @@ async fn handle_chat_session(
                 )
                 .await
                 {
-                    Ok((path, size, elapsed)) => {
+                    Ok(IncomingStreamResult::File { path, size, duration }) => {
                         println!("\n------------------------------------------------------------");
-                        let speed_mbs = (size as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64().max(0.001);
+                        let speed_mbs = (size as f64 / (1024.0 * 1024.0)) / duration.as_secs_f64().max(0.001);
                         println!(" ✅ [파일 수신 완료!]");
                         println!("  • 저장 위치 : {:?}", path);
                         println!("  • 파일 크기 : {:.2} MB", size as f64 / (1024.0 * 1024.0));
-                        println!("  • 소요 시간 : {:.2}초 ({:.2} MB/s)", elapsed.as_secs_f64(), speed_mbs);
+                        println!("  • 소요 시간 : {:.2}초 ({:.2} MB/s)", duration.as_secs_f64(), speed_mbs);
+                        println!("------------------------------------------------------------\n");
+                    }
+                    Ok(IncomingStreamResult::Benchmark { megabytes, duration, speed_mbs }) => {
+                        println!("\n------------------------------------------------------------");
+                        println!(" ✅ [바이너리 벤치마크 수신 완료]");
+                        println!("  • 데이터 수신량 : {:.2} MB", megabytes);
+                        println!("  • 소요 시간     : {:.2}초", duration.as_secs_f64());
+                        println!("  • ⚡ [수신 대역폭] 👉 {:.2} MB/s ({:.2} Mbps)", speed_mbs, speed_mbs * 8.0);
                         println!("------------------------------------------------------------\n");
                     }
                     Err(e) => {
-                        eprintln!("\n [오류] 파일 수신 중 오류 발생: {:?}", e);
+                        eprintln!("\n [오류] 스트림 수신 처리 중 오류: {:?}", e);
                     }
                 }
             });
@@ -394,7 +409,6 @@ async fn handle_chat_session(
                             println!(" 통계 요약 : {}", format_stats_info(conn));
                             println!("------------------------------------------------------------");
                         } else if trimmed.starts_with("/send") || trimmed.starts_with("/file") {
-                            // 대화 중 파일 전송 명령 (/send <경로>)
                             let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
                             if parts.len() < 2 {
                                 println!(" [사용법] /send <전송할_파일_경로> (예: /send D:\\photo.png)");
@@ -442,32 +456,27 @@ async fn handle_chat_session(
                             let _ = framed_send.send(format!("__PING__:1:{}:{}", now, count)).await;
                         } else if trimmed.starts_with("/bench") {
                             let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                            let mb: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(5).clamp(1, 50);
+                            let mb: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(10).clamp(1, 200);
 
-                            println!(" 🚀 [대역폭 측정] {} MB 데이터 전송 속도를 측정합니다...", mb);
-                            let chunk_size = 64 * 1024; // 64KB 청크
-                            let chunk = "X".repeat(chunk_size);
-                            let chunk_msg = format!("__BENCH_CHUNK__:{}", chunk);
-                            let total_bytes = mb * 1024 * 1024;
-                            let num_chunks = total_bytes / chunk_size;
-
-                            let _ = framed_send.send(format!("__BENCH_START__:{}", total_bytes)).await;
-                            let start = std::time::Instant::now();
-                            for _ in 0..num_chunks {
-                                if let Err(e) = framed_send.send(chunk_msg.clone()).await {
-                                    eprintln!(" [오류] 벤치마크 전송 중 에러: {:?}", e);
-                                    break;
+                            println!(" 🚀 [고속 대역폭 측정] {} MB 바이너리 스트리밍 전송을 시작합니다...", mb);
+                            match conn.open_bi().await {
+                                Ok((send, recv)) => {
+                                    match send_benchmark_stream(send, recv, mb).await {
+                                        Ok((megabytes, elapsed, speed_mbs)) => {
+                                            println!("------------------------------------------------------------");
+                                            println!(" ✅ [송신 완료] 총 전송량: {} MB | 소요 시간: {:.2}초", megabytes, elapsed.as_secs_f64());
+                                            println!(" ⚡ [송신 대역폭] 👉 {:.2} MB/s ({:.2} Mbps)", speed_mbs, speed_mbs * 8.0);
+                                            println!("------------------------------------------------------------\n");
+                                        }
+                                        Err(e) => {
+                                            eprintln!(" [오류] 벤치마크 전송 실패: {:?}", e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(" [오류] 벤치마크 스트림 생성 실패: {:?}", e);
                                 }
                             }
-                            let _ = framed_send.send("__BENCH_END__:done".to_string()).await;
-                            let elapsed = start.elapsed().as_secs_f64();
-                            let speed_mbs = (mb as f64) / elapsed;
-                            let speed_mbps = speed_mbs * 8.0;
-
-                            println!("------------------------------------------------------------");
-                            println!(" ✅ [송신 완료] 총 전송량: {} MB | 소요 시간: {:.2}초", mb, elapsed);
-                            println!(" ⚡ [송신 대역폭] 👉 {:.2} MB/s ({:.2} Mbps)", speed_mbs, speed_mbps);
-                            println!("------------------------------------------------------------");
                         } else if !trimmed.is_empty() {
                             if let Err(e) = framed_send.send(trimmed.to_string()).await {
                                 eprintln!(" [오류] 메시지 전송 실패: {:?}", e);
@@ -516,31 +525,6 @@ async fn handle_chat_session(
                                         println!("\n{}", format_ping_distribution_report(&report));
                                     }
                                 }
-                            }
-                        } else if msg.starts_with("__BENCH_START__:") {
-                            bench_receive_start = Some((std::time::Instant::now(), 0));
-                            println!(" 📥 [성능 측정] 상대방이 보낸 대역폭 벤치마크 데이터를 수신 중입니다...");
-                        } else if msg.starts_with("__BENCH_CHUNK__:") {
-                            if let Some((_, total)) = &mut bench_receive_start {
-                                *total += msg.len();
-                            }
-                        } else if msg.starts_with("__BENCH_END__:") {
-                            if let Some((start, total)) = bench_receive_start.take() {
-                                let elapsed = start.elapsed().as_secs_f64();
-                                let mbytes = total as f64 / (1024.0 * 1024.0);
-                                let speed_mbs = mbytes / elapsed;
-                                let speed_mbps = speed_mbs * 8.0;
-
-                                println!("------------------------------------------------------------");
-                                println!(" ✅ [수신 완료] 총 수신량: {:.2} MB | 소요 시간: {:.2}초", mbytes, elapsed);
-                                println!(" ⚡ [수신 대역폭] 👉 {:.2} MB/s ({:.2} Mbps)", speed_mbs, speed_mbps);
-                                println!("------------------------------------------------------------");
-                                let _ = framed_send.send(format!("__BENCH_REPORT__:{:.2}:{:.2}:{:.2}", mbytes, elapsed, speed_mbs)).await;
-                            }
-                        } else if msg.starts_with("__BENCH_REPORT__:") {
-                            let parts: Vec<&str> = msg.split(':').collect();
-                            if parts.len() >= 4 {
-                                println!(" ℹ️ [상대방 측정 결과] 수신량: {} MB | 시간: {}s | 대역폭: {} MB/s", parts[1], parts[2], parts[3]);
                             }
                         } else {
                             println!(" [상대방] {}", msg);
