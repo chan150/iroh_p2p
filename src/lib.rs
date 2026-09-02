@@ -128,3 +128,138 @@ pub fn format_stats_info(conn: &iroh::endpoint::Connection) -> String {
         stats.lost_packets,
     )
 }
+
+/// Ping 레이턴시 정밀 분포 통계 데이터
+#[derive(Debug, Clone)]
+pub struct PingDistributionStats {
+    pub sent: usize,
+    pub received: usize,
+    pub loss_rate: f64,
+    pub min_ms: u128,
+    pub max_ms: u128,
+    pub avg_ms: f64,
+    pub std_dev_ms: f64,
+    pub jitter_ms: f64,
+    pub p50_ms: u128,
+    pub p90_ms: u128,
+    pub p95_ms: u128,
+    pub p99_ms: u128,
+    pub buckets: Vec<(u128, u128, usize, f64)>, // (구간 시작, 구간 끝, 개수, 비율%)
+}
+
+/// 수집된 RTT 샘플들로부터 레이턴시 분포, 백분위수, 지터, 표준편차 및 히스토그램을 계산합니다.
+pub fn analyze_ping_distribution(mut rtts: Vec<u128>, total_sent: usize) -> Option<PingDistributionStats> {
+    if rtts.is_empty() {
+        return None;
+    }
+    rtts.sort_unstable();
+    let n = rtts.len();
+    let min_ms = rtts[0];
+    let max_ms = rtts[n - 1];
+    let sum: u128 = rtts.iter().sum();
+    let avg_ms = sum as f64 / n as f64;
+
+    // 분산 및 표준편차 계산
+    let variance = rtts
+        .iter()
+        .map(|&x| {
+            let diff = x as f64 - avg_ms;
+            diff * diff
+        })
+        .sum::<f64>()
+        / n as f64;
+    let std_dev_ms = variance.sqrt();
+
+    // 지터 (RFC 3550: 인접 RTT 차이의 평균)
+    let jitter_ms = if n > 1 {
+        let diff_sum: u128 = rtts.windows(2).map(|w| w[1].abs_diff(w[0])).sum();
+        diff_sum as f64 / (n - 1) as f64
+    } else {
+        0.0
+    };
+
+    // 백분위수 (Percentiles)
+    let p50_ms = rtts[(n as f64 * 0.50).min((n - 1) as f64) as usize];
+    let p90_ms = rtts[(n as f64 * 0.90).min((n - 1) as f64) as usize];
+    let p95_ms = rtts[(n as f64 * 0.95).min((n - 1) as f64) as usize];
+    let p99_ms = rtts[(n as f64 * 0.99).min((n - 1) as f64) as usize];
+
+    let loss_rate = if total_sent > 0 {
+        ((total_sent.saturating_sub(n)) as f64 / total_sent as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // 히스토그램 버킷 구성 (4~6개 구간)
+    let num_buckets = 5.min((max_ms.saturating_sub(min_ms) + 1) as usize).max(1);
+    let step = (((max_ms - min_ms) as f64 / num_buckets as f64).ceil() as u128).max(1);
+    let mut buckets = Vec::new();
+
+    for i in 0..num_buckets {
+        let b_start = min_ms + (i as u128 * step);
+        let b_end = if i == num_buckets - 1 {
+            max_ms
+        } else {
+            b_start + step - 1
+        };
+        let count = rtts.iter().filter(|&&r| r >= b_start && r <= b_end).count();
+        let pct = (count as f64 / n as f64) * 100.0;
+        buckets.push((b_start, b_end, count, pct));
+    }
+
+    Some(PingDistributionStats {
+        sent: total_sent,
+        received: n,
+        loss_rate,
+        min_ms,
+        max_ms,
+        avg_ms,
+        std_dev_ms,
+        jitter_ms,
+        p50_ms,
+        p90_ms,
+        p95_ms,
+        p99_ms,
+        buckets,
+    })
+}
+
+/// 레이턴시 분포 통계를 터미널에 시각적으로 출력하기 위한 포맷 함수
+pub fn format_ping_distribution_report(stats: &PingDistributionStats) -> String {
+    let mut out = String::new();
+    out.push_str("============================================================\n");
+    out.push_str(&format!(
+        " 📊 [PING 레이턴시 정밀 분포 분석 리포트 (총 {}회 시도)]\n",
+        stats.sent
+    ));
+    out.push_str("============================================================\n");
+    out.push_str(&format!(
+        " • 패킷 전송/수신 : {} / {} pkts (손실률: {:.1}%)\n",
+        stats.sent, stats.received, stats.loss_rate
+    ));
+    out.push_str(&format!(
+        " • 최소 / 최대    : {} ms / {} ms\n",
+        stats.min_ms, stats.max_ms
+    ));
+    out.push_str(&format!(
+        " • 평균 ± 표준편차: {:.2} ms ± {:.2} ms (지터: {:.2} ms)\n",
+        stats.avg_ms, stats.std_dev_ms, stats.jitter_ms
+    ));
+    out.push_str(&format!(
+        " • 백분위수(p-tile): p50(중앙값)={}ms | p90={}ms | p95={}ms | p99={}ms\n",
+        stats.p50_ms, stats.p90_ms, stats.p95_ms, stats.p99_ms
+    ));
+    out.push_str("------------------------------------------------------------\n");
+    out.push_str(" [지연시간 구간별 빈도 분포도 (Histogram)]\n");
+
+    for (start, end, count, pct) in &stats.buckets {
+        let bar_len = (pct / 3.0).round() as usize;
+        let bar = "█".repeat(bar_len);
+        out.push_str(&format!(
+            "  {:>4} ~ {:<4} ms : {:>3}개 ({:>5.1}%)  {}\n",
+            start, end, count, pct, bar
+        ));
+    }
+    out.push_str("============================================================");
+    out
+}

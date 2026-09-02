@@ -3,8 +3,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use iroh_p2p_example::{
-    create_endpoint, create_endpoint_with_secret_key, decode_ticket, derive_channel_keys,
-    encode_ticket, format_path_info, format_stats_info, CHAT_ALPN,
+    analyze_ping_distribution, create_endpoint, create_endpoint_with_secret_key, decode_ticket,
+    derive_channel_keys, encode_ticket, format_path_info, format_ping_distribution_report,
+    format_stats_info, CHAT_ALPN,
 };
 use tokio::io::AsyncBufReadExt;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
@@ -172,10 +173,10 @@ fn print_session_guide() {
     println!("------------------------------------------------------------");
     println!(" 실시간 대화 및 성능 측정 준비 완료!");
     println!("  • 일반 텍스트 입력 후 Enter: 메시지 전송");
-    println!("  • /ping       : 왕복 지연시간(RTT / Latency) 측정");
-    println!("  • /bench [MB] : 대역폭(Bandwidth / Throughput) 속도 측정 (기본: 5MB)");
-    println!("  • /stats      : QUIC 연결 상태 및 패킷 손실 통계");
-    println!("  • /help       : 명령어 안내 | /quit : 대화 종료");
+    println!("  • /ping [횟수] : 왕복 지연시간(RTT) 및 레이턴시 분포도 분석 (기본: 20회)");
+    println!("  • /bench [MB]  : 대역폭(Bandwidth / Throughput) 속도 측정 (기본: 5MB)");
+    println!("  • /stats       : QUIC 연결 상태 및 패킷 손실 통계");
+    println!("  • /help        : 명령어 안내 | /quit : 대화 종료");
     println!("------------------------------------------------------------\n");
 }
 
@@ -211,14 +212,17 @@ async fn handle_chat_session(
                             println!(" 경로 상태 : {}", format_path_info(conn));
                             println!(" 통계 요약 : {}", format_stats_info(conn));
                             println!("------------------------------------------------------------");
-                        } else if trimmed == "/ping" {
+                        } else if trimmed.starts_with("/ping") {
+                            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                            let count: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(20).clamp(1, 500);
+
                             ping_stats.clear();
-                            println!(" ⏱️ [PING] 5회 왕복 지연시간 측정을 시작합니다...");
+                            println!(" ⏱️ [PING] {}회 왕복 지연시간 측정 및 분포 분석을 시작합니다...", count);
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
                                 .as_millis();
-                            let _ = framed_send.send(format!("__PING__:1:{}:5", now)).await;
+                            let _ = framed_send.send(format!("__PING__:1:{}:{}", now, count)).await;
                         } else if trimmed.starts_with("/bench") {
                             let parts: Vec<&str> = trimmed.split_whitespace().collect();
                             let mb: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(5).clamp(1, 50);
@@ -275,7 +279,7 @@ async fn handle_chat_session(
                             if parts.len() >= 4 {
                                 let seq: usize = parts[1].parse().unwrap_or(1);
                                 let ts: u128 = parts[2].parse().unwrap_or(0);
-                                let total: usize = parts[3].parse().unwrap_or(5);
+                                let total: usize = parts[3].parse().unwrap_or(20);
 
                                 let now = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -283,24 +287,21 @@ async fn handle_chat_session(
                                     .as_millis();
                                 let rtt = now.saturating_sub(ts);
                                 ping_stats.push(rtt);
-                                println!(" 🎯 [Ping #{}/{}] RTT (지연시간): {} ms", seq, total, rtt);
+                                println!(" 🎯 [Ping #{}/{}] RTT: {} ms", seq, total, rtt);
 
-                                // 다음 PING 전송 (비동기 이벤트 루프 방해 없이 순차 진행)
+                                // 다음 PING 전송 (50ms 간격으로 빠르게 진행)
                                 if seq < total {
-                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                     let next_now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap()
                                         .as_millis();
                                     let _ = framed_send.send(format!("__PING__:{}:{}:{}", seq + 1, next_now, total)).await;
                                 } else {
-                                    // 5회 완료 시 통계 출력
-                                    let min = ping_stats.iter().min().copied().unwrap_or(0);
-                                    let max = ping_stats.iter().max().copied().unwrap_or(0);
-                                    let avg: f64 = ping_stats.iter().sum::<u128>() as f64 / ping_stats.len() as f64;
-                                    println!("------------------------------------------------------------");
-                                    println!(" 📊 [PING 통계] 최소: {}ms | 최대: {}ms | 평균: {:.1}ms", min, max, avg);
-                                    println!("------------------------------------------------------------");
+                                    // 측정 완료 시 정밀 레이턴시 분포 리포트 출력
+                                    if let Some(report) = analyze_ping_distribution(ping_stats.clone(), total) {
+                                        println!("\n{}", format_ping_distribution_report(&report));
+                                    }
                                 }
                             }
                         } else if msg.starts_with("__BENCH_START__:") {

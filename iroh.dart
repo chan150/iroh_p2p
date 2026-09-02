@@ -1,4 +1,5 @@
 ﻿import 'dart:async';
+import 'dart:math';
 
 /// Iroh P2P 연결 상태 및 이벤트 모델
 sealed class IrohEvent {}
@@ -53,21 +54,56 @@ class IrohPingResultEvent extends IrohEvent {
   String toString() => 'IrohPingResultEvent(seq: $seq/$total, rtt: ${rttMs}ms)';
 }
 
-/// Ping 5회 측정 완료 통계 요약
-class IrohPingSummaryEvent extends IrohEvent {
+/// 히스토그램 구간 데이터
+class IrohLatencyBucket {
+  final int startMs;
+  final int endMs;
+  final int count;
+  final double percentage;
+
+  IrohLatencyBucket({
+    required this.startMs,
+    required this.endMs,
+    required this.count,
+    required this.percentage,
+  });
+}
+
+/// Ping 다중 측정 완료 레이턴시 분포(Distribution) 리포트
+class IrohPingDistributionEvent extends IrohEvent {
+  final int sent;
+  final int received;
+  final double lossRate;
   final int minMs;
   final int maxMs;
   final double avgMs;
+  final double stdDevMs;
+  final double jitterMs;
+  final int p50Ms; // 중앙값
+  final int p90Ms;
+  final int p95Ms;
+  final int p99Ms;
+  final List<IrohLatencyBucket> buckets;
 
-  IrohPingSummaryEvent({
+  IrohPingDistributionEvent({
+    required this.sent,
+    required this.received,
+    required this.lossRate,
     required this.minMs,
     required this.maxMs,
     required this.avgMs,
+    required this.stdDevMs,
+    required this.jitterMs,
+    required this.p50Ms,
+    required this.p90Ms,
+    required this.p95Ms,
+    required this.p99Ms,
+    required this.buckets,
   });
 
   @override
   String toString() =>
-      'IrohPingSummaryEvent(min: ${minMs}ms, max: ${maxMs}ms, avg: ${avgMs.toStringAsFixed(1)}ms)';
+      'IrohPingDistributionEvent(total: $sent, min: ${minMs}ms, max: ${maxMs}ms, avg: ${avgMs.toStringAsFixed(1)}ms, p50: ${p50Ms}ms, p95: ${p95Ms}ms, jitter: ${jitterMs.toStringAsFixed(1)}ms)';
 }
 
 /// 대역폭(Bandwidth) 벤치마크 결과
@@ -109,37 +145,16 @@ class IrohErrorEvent extends IrohEvent {
 }
 
 /// Flutter / Dart 애플리케이션을 위한 Iroh P2P 클라이언트 인터페이스
-/// 
-/// - 채널 번호(0, 1, 2...) 기반 Zero-Config 자동 연결
-/// - 수동 티켓(Ticket) 기반 연결
-/// - 실시간 메시지 송수신
-/// - /ping 지연시간 및 /bench 대역폭 측정 기능 지원
 abstract class IrohP2PClient {
-  /// 현재 P2P 이벤트 스트림 (UI에 실시간 연결)
   Stream<IrohEvent> get events;
-
-  /// 현재 연결 여부
   bool get isConnected;
-
-  /// 현재 연결된 원격 Node ID
   String? get remoteNodeId;
 
-  /// [Host] 특정 채널 번호(기본값: 0)로 수신 대기 시작
   Future<String> startHost({int channel = 0});
-
-  /// [Client] 채널 번호(예: 0, 1, 2) 또는 티켓 문자열로 원격 피어에 접속
   Future<void> connect({int? channel, String? ticket});
-
-  /// 일반 텍스트 메시지 전송
   Future<void> sendMessage(String message);
-
-  /// 실시간 지연시간(RTT) 측정 요청 (5회 핑-퐁)
-  Future<void> ping();
-
-  /// 대역폭(Throughput) 벤치마크 실행 (기본 5MB 전송)
+  Future<void> ping({int count = 20});
   Future<void> bench({int megabytes = 5});
-
-  /// 연결 종료
   Future<void> disconnect();
 }
 
@@ -156,7 +171,6 @@ class IrohP2PController implements IrohP2PClient {
   String? _remoteNodeId;
   String? _currentPathType;
 
-  // 저수준 송신 브릿지 함수 (FRB / StreamSink)
   final Future<void> Function(String rawMessage)? _rawSender;
 
   IrohP2PController({Future<void> Function(String rawMessage)? rawSender})
@@ -197,10 +211,11 @@ class IrohP2PController implements IrohP2PClient {
   }
 
   @override
-  Future<void> ping() async {
+  Future<void> ping({int count = 20}) async {
+    final clampedCount = count.clamp(1, 500);
     _pingSamples.clear();
     final now = DateTime.now().millisecondsSinceEpoch;
-    await _sendRaw('__PING__:1:$now:5');
+    await _sendRaw('__PING__:1:$now:$clampedCount');
   }
 
   @override
@@ -221,7 +236,7 @@ class IrohP2PController implements IrohP2PClient {
     await _sendRaw('__BENCH_END__:done');
     final elapsedSec =
         DateTime.now().difference(startTime).inMicroseconds / 1000000.0;
-    final speedMbs = clampedMb / elapsedSec;
+    final speedMbs = clampedMb / (elapsedSec > 0 ? elapsedSec : 0.001);
 
     final report = IrohBenchReportEvent(
       megabytes: clampedMb.toDouble(),
@@ -243,16 +258,14 @@ class IrohP2PController implements IrohP2PClient {
   /// Rust 코어 / 수신 스트림으로부터 들어오는 원시 메시지를 파싱하여 이벤트로 변환
   void handleIncomingRaw(String raw) {
     if (raw.startsWith('__PING__:')) {
-      // PING 수신 -> PONG 자동 응답
       final pong = raw.replaceFirst('__PING__:', '__PONG__:');
       _sendRaw(pong);
     } else if (raw.startsWith('__PONG__:')) {
-      // PONG 수신 -> RTT 계산
       final parts = raw.split(':');
       if (parts.length >= 4) {
         final seq = int.tryParse(parts[1]) ?? 1;
         final ts = int.tryParse(parts[2]) ?? 0;
-        final total = int.tryParse(parts[3]) ?? 5;
+        final total = int.tryParse(parts[3]) ?? 20;
 
         final now = DateTime.now().millisecondsSinceEpoch;
         final rtt = (now - ts).clamp(0, 999999);
@@ -265,20 +278,16 @@ class IrohP2PController implements IrohP2PClient {
         ));
 
         if (seq < total) {
-          Future.delayed(const Duration(milliseconds: 150), () {
+          Future.delayed(const Duration(milliseconds: 50), () {
             final nextNow = DateTime.now().millisecondsSinceEpoch;
             _sendRaw('__PING__:${seq + 1}:$nextNow:$total');
           });
         } else {
-          final min = _pingSamples.reduce((a, b) => a < b ? a : b);
-          final max = _pingSamples.reduce((a, b) => a > b ? a : b);
-          final avg = _pingSamples.reduce((a, b) => a + b) / _pingSamples.length;
-
-          _eventController.add(IrohPingSummaryEvent(
-            minMs: min,
-            maxMs: max,
-            avgMs: avg,
-          ));
+          // 다중 측정 완료 -> 분포 분석 리포트 생성
+          final report = _calculateDistributionReport(total);
+          if (report != null) {
+            _eventController.add(report);
+          }
         }
       }
     } else if (raw.startsWith('__BENCH_START__:')) {
@@ -307,7 +316,6 @@ class IrohP2PController implements IrohP2PClient {
         _benchStartTime = null;
       }
     } else if (raw.startsWith('__BENCH_REPORT__:')) {
-      // 상대방의 수신 레포트
       final parts = raw.split(':');
       if (parts.length >= 4) {
         final mb = double.tryParse(parts[1]) ?? 0;
@@ -321,7 +329,6 @@ class IrohP2PController implements IrohP2PClient {
         ));
       }
     } else if (raw.startsWith('__CONNECTED__:')) {
-      // 내부 핸드셰이크 연결 알림
       final parts = raw.split(':');
       _isConnected = true;
       _remoteNodeId = parts.length > 1 ? parts[1] : 'Unknown';
@@ -334,9 +341,76 @@ class IrohP2PController implements IrohP2PClient {
     } else if (raw == '[상대방이 대화를 종료했습니다]' || raw.startsWith('__DISCONNECTED__')) {
       _handleDisconnected('상대방이 연결을 종료했습니다.');
     } else {
-      // 일반 대화 메시지
       _eventController.add(IrohMessageReceivedEvent(message: raw));
     }
+  }
+
+  IrohPingDistributionEvent? _calculateDistributionReport(int totalSent) {
+    if (_pingSamples.isEmpty) return null;
+    final sorted = List<int>.from(_pingSamples)..sort();
+    final n = sorted.length;
+    final minMs = sorted.first;
+    final maxMs = sorted.last;
+    final sum = sorted.reduce((a, b) => a + b);
+    final avgMs = sum / n;
+
+    // 분산 / 표준편차
+    final variance =
+        sorted.map((x) => pow(x - avgMs, 2)).reduce((a, b) => a + b) / n;
+    final stdDevMs = sqrt(variance);
+
+    // 지터
+    double jitterMs = 0.0;
+    if (n > 1) {
+      int diffSum = 0;
+      for (int i = 0; i < n - 1; i++) {
+        diffSum += (sorted[i + 1] - sorted[i]).abs();
+      }
+      jitterMs = diffSum / (n - 1);
+    }
+
+    // 백분위수
+    final p50Ms = sorted[(n * 0.50).clamp(0, n - 1).toInt()];
+    final p90Ms = sorted[(n * 0.90).clamp(0, n - 1).toInt()];
+    final p95Ms = sorted[(n * 0.95).clamp(0, n - 1).toInt()];
+    final p99Ms = sorted[(n * 0.99).clamp(0, n - 1).toInt()];
+
+    final lossRate =
+        totalSent > 0 ? ((totalSent - n) / totalSent) * 100.0 : 0.0;
+
+    // 히스토그램 버킷 생성 (5개 구간)
+    final numBuckets = min(5, max(1, maxMs - minMs + 1));
+    final step = max(1, ((maxMs - minMs) / numBuckets).ceil());
+    final List<IrohLatencyBucket> buckets = [];
+
+    for (int i = 0; i < numBuckets; i++) {
+      final bStart = minMs + (i * step);
+      final bEnd = i == numBuckets - 1 ? maxMs : bStart + step - 1;
+      final count = sorted.where((r) => r >= bStart && r <= bEnd).length;
+      final pct = (count / n) * 100.0;
+      buckets.add(IrohLatencyBucket(
+        startMs: bStart,
+        endMs: bEnd,
+        count: count,
+        percentage: pct,
+      ));
+    }
+
+    return IrohPingDistributionEvent(
+      sent: totalSent,
+      received: n,
+      lossRate: lossRate,
+      minMs: minMs,
+      maxMs: maxMs,
+      avgMs: avgMs,
+      stdDevMs: stdDevMs,
+      jitterMs: jitterMs,
+      p50Ms: p50Ms,
+      p90Ms: p90Ms,
+      p95Ms: p95Ms,
+      p99Ms: p99Ms,
+      buckets: buckets,
+    );
   }
 
   void _handleDisconnected(String reason) {
