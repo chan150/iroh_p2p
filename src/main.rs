@@ -4,8 +4,9 @@ use futures_util::{SinkExt, StreamExt};
 use iroh_p2p_example::{
     analyze_ping_distribution, create_endpoint, create_endpoint_with_secret_key, decode_ticket,
     derive_channel_keys, dispatch_incoming_bi_stream, encode_ticket, format_path_info,
-    format_ping_distribution_report, format_stats_info, send_benchmark_stream,
-    send_file_stream, IncomingStreamResult, CHAT_ALPN,
+    format_ping_distribution_report, format_stats_info, read_exact_stream,
+    remote::{receive_screen_frame, RemoteControlEvent, ScreenStreamer, WindowsInputSimulator},
+    send_benchmark_stream, send_file_stream, IncomingStreamResult, CHAT_ALPN,
 };
 use std::io::Write;
 use tokio::io::AsyncBufReadExt;
@@ -13,7 +14,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 #[derive(Parser, Debug)]
 #[command(name = "iroh-p2p-example")]
-#[command(about = "공유기/방화벽 뒤에서도 동작하는 초고속 Iroh P2P 통신 및 파일 전송 소프트웨어", long_about = None)]
+#[command(about = "공유기/방화벽 뒤에서도 동작하는 초고속 Iroh P2P 통신, 파일 전송, 실시간 화면 공유 및 원격 제어", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -50,6 +51,24 @@ enum Commands {
         #[arg(short, long)]
         save_dir: Option<std::path::PathBuf>,
     },
+    /// 실시간 화면 공유 서버 모드 (내 화면을 피어에게 스트리밍)
+    Share {
+        /// 수신 대기할 채널 번호 (기본값: 0)
+        #[arg(default_value = "0")]
+        channel: u32,
+        /// 초당 프레임 수 (기본값: 30)
+        #[arg(long, default_value = "30")]
+        fps: u32,
+        /// JPEG 압축 품질 (30 ~ 95, 기본값: 75)
+        #[arg(long, default_value = "75")]
+        quality: u8,
+    },
+    /// 원격 화면 수신 및 제어 뷰어 모드
+    View {
+        /// 접속할 채널 번호 또는 티켓 (기본값: 0)
+        #[arg(default_value = "0")]
+        target: String,
+    },
 }
 
 #[tokio::main]
@@ -68,6 +87,8 @@ async fn main() -> Result<()> {
         Commands::Connect { target } => run_connector(target).await?,
         Commands::Send { target, file } => run_file_sender(target, file).await?,
         Commands::Recv { channel, save_dir } => run_file_receiver(channel, save_dir).await?,
+        Commands::Share { channel, fps, quality } => run_screen_sharer(channel, fps, quality).await?,
+        Commands::View { target } => run_screen_viewer(target).await?,
     }
 
     Ok(())
@@ -75,11 +96,14 @@ async fn main() -> Result<()> {
 
 fn print_session_guide() {
     println!("------------------------------------------------------------");
-    println!(" 🚀 실시간 P2P 통신 및 파일 전송 준비 완료!");
+    println!(" 🚀 실시간 P2P 통신, 파일 전송, 화면 공유 및 원격 제어!");
     println!("  • 일반 텍스트 입력 후 Enter: 메시지 전송");
     println!("  • /send <파일경로>  : 로컬 파일을 상대방에게 초고속 스트리밍 전송");
+    println!("  • /share [FPS] [품질] : 내 화면 실시간 공유 시작 (기본: 30 FPS, 75%)");
+    println!("  • /mouse <x> <y>    : 원격 마우스 커서 이동 테스트 (비율 0.0 ~ 1.0)");
+    println!("  • /click <L|R>      : 원격 마우스 클릭 테스트 (L: 좌클릭, R: 우클릭)");
     println!("  • /ping [횟수]      : 왕복 지연시간(RTT) 및 레이턴시 분포도 분석 (기본: 20회)");
-    println!("  • /bench [MB]       : 대역폭(Throughput) 속도 측정 (기본: 5MB)");
+    println!("  • /bench [MB]       : 대역폭(Throughput) 속도 측정 (기본: 10MB)");
     println!("  • /stats            : QUIC 연결 상태 및 패킷 손실 통계");
     println!("  • /help             : 명령어 안내 | /quit : 대화 종료");
     println!("------------------------------------------------------------\n");
@@ -306,11 +330,141 @@ async fn run_file_receiver(channel: u32, save_dir_opt: Option<std::path::PathBuf
                         println!("  • ⚡ 대역폭 : {:.2} MB/s ({:.2} Mbps)", speed_mbs, speed_mbs * 8.0);
                         println!("------------------------------------------------------------\n");
                     }
+                    Ok(IncomingStreamResult::ScreenStream { .. }) | Ok(IncomingStreamResult::ControlStream { .. }) => {
+                        // 파일 전용 수신기에서는 화면/제어 스트림 무시
+                    }
                     Err(e) => {
                         eprintln!("\n [오류] 스트림 처리 실패: {:?}", e);
                     }
                 }
             });
+        }
+    }
+
+    endpoint.close().await;
+    Ok(())
+}
+
+/// [실시간 화면 공유 호스트 모드]
+async fn run_screen_sharer(channel: u32, fps: u32, quality: u8) -> Result<()> {
+    let (secret_key, _) = derive_channel_keys(channel);
+
+    println!("============================================================");
+    println!(" 🖥️ [Iroh P2P 실시간 화면 공유 호스트] - 채널 #{}", channel);
+    println!(" 설정: FPS {}, JPEG 압축 품질 {}%", fps, quality);
+    println!(" 상대방 뷰어 접속을 대기하고 있습니다...");
+    println!(" 👉 .\\iroh-p2p-example.exe view {}", channel);
+    println!("============================================================");
+
+    let endpoint = create_endpoint_with_secret_key(Some(secret_key), vec![CHAT_ALPN.to_vec()]).await?;
+    let input_sim = std::sync::Arc::new(WindowsInputSimulator::new());
+
+    while let Some(incoming) = endpoint.accept().await {
+        let conn = match incoming.await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(" [오류] 연결 실패: {:?}", e);
+                continue;
+            }
+        };
+
+        println!("\n 🔗 [뷰어 접속 완료!] 화면 스트리밍을 시작합니다.");
+
+        // 1. 화면 전송 스트림 시작
+        let (send_screen, _recv) = conn.open_bi().await.context("화면 스트림 생성 실패")?;
+        let streamer = ScreenStreamer::new(0, fps, quality)?;
+        tokio::spawn(async move {
+            if let Err(e) = streamer.start_stream(send_screen).await {
+                eprintln!(" [화면 스트리밍 종료/오류]: {:?}", e);
+            }
+        });
+
+        // 2. 원격 마우스/키보드 제어 이벤트 수신 루프
+        let sim_clone = input_sim.clone();
+        let conn_clone = conn.clone();
+        tokio::spawn(async move {
+            while let Ok((_, recv_ctrl)) = conn_clone.accept_bi().await {
+                let sim = sim_clone.clone();
+                tokio::spawn(async move {
+                    let mut reader = tokio::io::BufReader::new(recv_ctrl);
+                    let mut line_buf = String::new();
+                    while let Ok(n) = reader.read_line(&mut line_buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if let Some(event) = RemoteControlEvent::deserialize(&line_buf) {
+                            sim.execute(event);
+                        }
+                        line_buf.clear();
+                    }
+                });
+            }
+        });
+    }
+
+    endpoint.close().await;
+    Ok(())
+}
+
+/// [원격 화면 수신 뷰어 모드]
+async fn run_screen_viewer(target_input: String) -> Result<()> {
+    let trimmed = target_input.trim();
+    let (remote_addr, mode_label) = if let Ok(channel) = trimmed.parse::<u32>() {
+        let (_, target_addr) = derive_channel_keys(channel);
+        (target_addr, format!("채널 #{} 화면 수신 뷰어", channel))
+    } else {
+        let target_addr = decode_ticket(trimmed)?;
+        (target_addr, "티켓 화면 수신 뷰어".to_string())
+    };
+
+    println!("============================================================");
+    println!(" 📺 [Iroh P2P 원격 뷰어] - {}", mode_label);
+    println!(" 원격 화면 호스트에 연결 중...");
+    println!("============================================================");
+
+    let endpoint = create_endpoint(vec![]).await?;
+    let conn = endpoint.connect(remote_addr, CHAT_ALPN).await.context("화면 호스트 연결 실패")?;
+
+    println!(" 🔗 [연결 성공!] 실시간 프레임 수신을 시작합니다...\n");
+
+    // 스트림 수신 대기
+    while let Ok((_, mut recv)) = conn.accept_bi().await {
+        let mut magic = [0u8; 4];
+        if read_exact_stream(&mut recv, &mut magic).await.is_err() {
+            continue;
+        }
+
+        if &magic == b"SCRN" {
+            let mut frame_count = 0u64;
+            let mut total_bytes = 0u64;
+            let start_time = std::time::Instant::now();
+            let mut last_log = std::time::Instant::now();
+
+            loop {
+                match receive_screen_frame(&mut recv).await {
+                    Ok(frame) => {
+                        frame_count += 1;
+                        total_bytes += frame.jpeg_data.len() as u64;
+
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_log).as_millis() >= 500 {
+                            let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+                            let current_fps = frame_count as f64 / elapsed;
+                            let bitrate_mbps = (total_bytes as f64 * 8.0 / (1024.0 * 1024.0)) / elapsed;
+                            print!(
+                                "\r 🖥️ [화면 수신 중] 해상도: {}x{} | 프레임 #{:<6} | 실측 FPS: {:>4.1} | 비트레이트: {:>5.2} Mbps  ",
+                                frame.width, frame.height, frame.frame_seq, current_fps, bitrate_mbps
+                            );
+                            let _ = std::io::stdout().flush();
+                            last_log = now;
+                        }
+                    }
+                    Err(e) => {
+                        println!("\n [알림] 화면 스트림이 종료되었습니다: {:?}", e);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -336,7 +490,7 @@ fn render_progress(action: &str, current: u64, total: u64, speed_mbs: f64) {
     let _ = std::io::stdout().flush();
 }
 
-/// 양방향 스트림을 통한 실시간 텍스트 채팅 및 대화 중 파일 전송 처리
+/// 양방향 스트림을 통한 실시간 텍스트 채팅, 파일 전송, 화면 공유 및 원격 제어 처리
 async fn handle_chat_session(
     conn: &iroh::endpoint::Connection,
     send_stream: iroh::endpoint::SendStream,
@@ -347,11 +501,14 @@ async fn handle_chat_session(
 
     let mut stdin_lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut ping_stats: Vec<u128> = Vec::new();
+    let input_sim = std::sync::Arc::new(WindowsInputSimulator::new());
 
-    // 백그라운드 스트림 수신 태스크: 파일 전송 및 고속 바이너리 벤치마크 자동 디스패치
+    // 백그라운드 스트림 수신 태스크: 파일 전송, 고속 벤치마크, 화면 수신, 원격 제어 디스패치
     let conn_clone = conn.clone();
+    let sim_clone = input_sim.clone();
     tokio::spawn(async move {
         while let Ok((send, recv)) = conn_clone.accept_bi().await {
+            let sim = sim_clone.clone();
             tokio::spawn(async move {
                 match dispatch_incoming_bi_stream(
                     send,
@@ -379,6 +536,32 @@ async fn handle_chat_session(
                         println!("  • 소요 시간     : {:.2}초", duration.as_secs_f64());
                         println!("  • ⚡ [수신 대역폭] 👉 {:.2} MB/s ({:.2} Mbps)", speed_mbs, speed_mbs * 8.0);
                         println!("------------------------------------------------------------\n");
+                    }
+                    Ok(IncomingStreamResult::ScreenStream { mut recv_stream, .. }) => {
+                        println!("\n 🖥️ [알림] 상대방이 화면 공유 스트리밍을 시작했습니다...");
+                        tokio::spawn(async move {
+                            let mut count = 0u64;
+                            while let Ok(_frame) = receive_screen_frame(&mut recv_stream).await {
+                                count += 1;
+                                if count % 30 == 0 {
+                                    print!("\r 🖥️ [화면 수신 중] 총 {} 프레임 수신됨...  ", count);
+                                    let _ = std::io::stdout().flush();
+                                }
+                            }
+                        });
+                    }
+                    Ok(IncomingStreamResult::ControlStream { recv_stream, .. }) => {
+                        tokio::spawn(async move {
+                            let mut reader = tokio::io::BufReader::new(recv_stream);
+                            let mut line_buf = String::new();
+                            while let Ok(n) = reader.read_line(&mut line_buf).await {
+                                if n == 0 { break; }
+                                if let Some(event) = RemoteControlEvent::deserialize(&line_buf) {
+                                    sim.execute(event);
+                                }
+                                line_buf.clear();
+                            }
+                        });
                     }
                     Err(e) => {
                         eprintln!("\n [오류] 스트림 수신 처리 중 오류: {:?}", e);
@@ -453,6 +636,68 @@ async fn handle_chat_session(
                                 .unwrap()
                                 .as_millis();
                             let _ = framed_send.send(format!("__PING__:1:{}:{}", now, count)).await;
+                        } else if trimmed.starts_with("/share") {
+                            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                            let fps: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(30).clamp(5, 60);
+                            let quality: u8 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(75).clamp(30, 95);
+
+                            match ScreenStreamer::new(0, fps, quality) {
+                                Ok(streamer) => {
+                                    match conn.open_bi().await {
+                                        Ok((send, _recv)) => {
+                                            tokio::spawn(async move {
+                                                if let Err(e) = streamer.start_stream(send).await {
+                                                    eprintln!(" [화면 공유 에러]: {:?}", e);
+                                                }
+                                            });
+                                            println!(" 🖥️ [화면 공유 시작] 상대방에게 내 화면 실시간 스트리밍을 시작했습니다! (FPS: {}, 품질: {}%)", fps, quality);
+                                        }
+                                        Err(e) => eprintln!(" [오류] 화면 공유 스트림 열기 실패: {:?}", e),
+                                    }
+                                }
+                                Err(e) => eprintln!(" [오류] 화면 캡처 초기화 실패: {:?}", e),
+                            }
+                        } else if trimmed.starts_with("/mouse") {
+                            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                            if parts.len() >= 3 {
+                                let x: f32 = parts[1].parse().unwrap_or(0.5);
+                                let y: f32 = parts[2].parse().unwrap_or(0.5);
+                                let event = RemoteControlEvent::MouseMove { x, y };
+                                match conn.open_bi().await {
+                                    Ok((mut send, _)) => {
+                                        let mut buf = Vec::new();
+                                        buf.extend_from_slice(b"CTRL");
+                                        let _ = send.write_all(&buf).await;
+                                        let _ = send.write_all(format!("{}\n", event.serialize()).as_bytes()).await;
+                                        let _ = send.finish();
+                                        println!(" 🖱️ [원격 마우스 이동 전송] x: {:.2}, y: {:.2}", x, y);
+                                    }
+                                    Err(e) => eprintln!(" [오류] 제어 스트림 열기 실패: {:?}", e),
+                                }
+                            } else {
+                                println!(" [사용법] /mouse <x비율 0.0~1.0> <y비율 0.0~1.0> (예: /mouse 0.5 0.5)");
+                            }
+                        } else if trimmed.starts_with("/click") {
+                            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                            let btn_str = parts.get(1).copied().unwrap_or("L");
+                            let button = if btn_str.eq_ignore_ascii_case("R") {
+                                iroh_p2p_example::remote::MouseButton::Right
+                            } else {
+                                iroh_p2p_example::remote::MouseButton::Left
+                            };
+                            match conn.open_bi().await {
+                                Ok((mut send, _)) => {
+                                    let mut buf = Vec::new();
+                                    buf.extend_from_slice(b"CTRL");
+                                    let _ = send.write_all(&buf).await;
+                                    let event_down = RemoteControlEvent::MouseDown { button };
+                                    let event_up = RemoteControlEvent::MouseUp { button };
+                                    let _ = send.write_all(format!("{}\n{}\n", event_down.serialize(), event_up.serialize()).as_bytes()).await;
+                                    let _ = send.finish();
+                                    println!(" 🖱️ [원격 마우스 클릭 전송] {:?}", button);
+                                }
+                                Err(e) => eprintln!(" [오류] 제어 스트림 열기 실패: {:?}", e),
+                            }
                         } else if trimmed.starts_with("/bench") {
                             let parts: Vec<&str> = trimmed.split_whitespace().collect();
                             let mb: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(10).clamp(1, 200);

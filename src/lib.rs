@@ -1,3 +1,5 @@
+pub mod remote;
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -264,7 +266,7 @@ pub fn format_ping_distribution_report(stats: &PingDistributionStats) -> String 
     out
 }
 
-async fn read_exact_stream(recv: &mut iroh::endpoint::RecvStream, buf: &mut [u8]) -> Result<()> {
+pub async fn read_exact_stream(recv: &mut iroh::endpoint::RecvStream, buf: &mut [u8]) -> Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
         match recv.read(&mut buf[filled..]).await.context("스트림 읽기 실패")? {
@@ -520,11 +522,12 @@ async fn receive_benchmark_body(
     Ok((mb, elapsed, speed_mbs))
 }
 
-/// 백그라운드로 유입되는 새로운 양방향 스트림의 헤더 매직을 검사하여 파일 수신 또는 벤치마크를 자동 디스패치합니다.
-#[derive(Debug)]
+/// 백그라운드로 유입되는 새로운 양방향 스트림의 헤더 매직을 검사하여 파일 수신, 벤치마크, 화면 공유, 제어 스트림을 자동 디스패치합니다.
 pub enum IncomingStreamResult {
     File { path: std::path::PathBuf, size: u64, duration: std::time::Duration },
     Benchmark { megabytes: f64, duration: std::time::Duration, speed_mbs: f64 },
+    ScreenStream { send_stream: iroh::endpoint::SendStream, recv_stream: iroh::endpoint::RecvStream },
+    ControlStream { send_stream: iroh::endpoint::SendStream, recv_stream: iroh::endpoint::RecvStream },
 }
 
 pub async fn dispatch_incoming_bi_stream<F>(
@@ -547,6 +550,12 @@ where
         b"BNCH" => {
             let (megabytes, duration, speed_mbs) = receive_benchmark_body(send_stream, recv_stream).await?;
             Ok(IncomingStreamResult::Benchmark { megabytes, duration, speed_mbs })
+        }
+        b"SCRN" => {
+            Ok(IncomingStreamResult::ScreenStream { send_stream, recv_stream })
+        }
+        b"CTRL" => {
+            Ok(IncomingStreamResult::ControlStream { send_stream, recv_stream })
         }
         _ => anyhow::bail!("알 수 없는 스트림 매직: {:?}", magic),
     }

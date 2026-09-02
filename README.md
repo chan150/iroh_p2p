@@ -78,8 +78,32 @@ cargo run -- connect 1
 # PC 1 (수신 대기):
 cargo run -- recv 0
 
-# PC 2 (파일 전송):
-cargo run -- send 0 "C:\path\to\large_archive.zip"
+---
+
+## 🖥️ 실시간 화면 공유 & 원격 제어 (Remote Desktop)
+
+두 PC 간에 별도의 복잡한 원격 제어 소프트웨어(팀뷰어, AnyDesk 등) 설치 없이, Iroh P2P로 직접 저지연 화면을 스트리밍하고 원격 마우스/키보드를 조작할 수 있습니다:
+
+### 1. 화면 공유 호스트 실행 (내 화면을 상대방에게 스트리밍)
+```bash
+# 채널 0번으로 화면 공유 시작 (기본: 30 FPS, JPEG 품질 75%)
+cargo run -- share 0
+
+# FPS 및 화질 지정 (예: 60 FPS, 품질 85%)
+cargo run -- share 0 --fps 60 --quality 85
+```
+
+### 2. 원격 뷰어 실행 (상대방 화면 수신 및 모니터링)
+```bash
+# 채널 0번 호스트 화면 수신
+cargo run -- view 0
+```
+
+### 3. 대화 세션 내에서 화면 공유 & 원격 제어
+```
+/share 30 75    : 대화 도중 내 화면을 상대방에게 실시간 공유 시작
+/mouse 0.5 0.5  : 원격 마우스 커서를 화면 중앙으로 이동 (0.0~1.0 비율 좌표)
+/click L        : 원격 마우스 좌클릭 (R: 우클릭)
 ```
 
 ---
@@ -89,6 +113,8 @@ cargo run -- send 0 "C:\path\to\large_archive.zip"
 ```bash
 cargo test -- --nocapture
 ```
+* `test_p2p_screen_frame_streaming`: 실시간 화면 프레임 스트리밍 및 파싱 검증
+* `test_remote_control_event_serialization`: 원격 마우스/키보드 제어 이벤트 직렬화/역직렬화 검증
 * `test_p2p_file_streaming_transfer`: P2P 파일 스트리밍 전송 및 100% 무결성 검증
 * `test_channel_zero_config_connection`: 티켓 없는 채널 기반 자동 P2P 연결 검증
 * `test_p2p_direct_or_relay_communication`: E2E P2P 데이터 통신 검증
@@ -99,8 +125,9 @@ cargo test -- --nocapture
 
 ## 📂 프로젝트 구조
 
-- `src/lib.rs`: 고속 파일 스트리밍 송수신 (`send_file_stream`, `receive_file_stream`), 레이턴시 분포 계산 (`analyze_ping_distribution`), 결정론적 채널 키 생성 (`derive_channel_keys`), 엔드포인트 생성, 통계 포맷팅
-- `src/main.rs`: 파일 전송/수신 전용 모드 및 대화 중 백그라운드 파일 전송 핸들러가 내장된 CLI
-- `iroh.dart`: Flutter / Dart 애플리케이션용 P2P 파일 전송, 실시간 메시징, 레이턴시 통계 클라이언트
-- `tests/p2p_test.rs`: 5개 시나리오 무인 자동화 E2E 통합 테스트
+- `src/remote.rs`: 고속 모니터 화면 캡처, JPEG 인코딩 스트리머 (`ScreenStreamer`), Windows 네이티브 입력 시뮬레이터 (`WindowsInputSimulator`), 원격 제어 프로토콜 (`RemoteControlEvent`)
+- `src/lib.rs`: 다중 스트림 자동 디스패처 (`dispatch_incoming_bi_stream`), 파일 스트리밍 (`send_file_stream`, `receive_file_stream`), 레이턴시 분포 계산 (`analyze_ping_distribution`), 결정론적 채널 키 생성 (`derive_channel_keys`)
+- `src/main.rs`: 파일 전송/수신, 실시간 화면 공유(`share`), 원격 뷰어(`view`) 및 대화형 CLI
+- `iroh.dart`: Flutter / Dart 애플리케이션용 화면 프레임 이벤트(`IrohScreenFrameEvent`), 마우스/키보드 원격 제어 API, P2P 파일 전송, 실시간 메시징 클라이언트
+- `tests/p2p_test.rs`: 7개 시나리오 무인 자동화 E2E 통합 테스트
 

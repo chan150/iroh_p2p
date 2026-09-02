@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
@@ -198,6 +198,27 @@ class IrohDisconnectedEvent extends IrohEvent {
   String toString() => 'IrohDisconnectedEvent(reason: $reason)';
 }
 
+/// 실시간 원격 화면 프레임 이벤트 (JPEG 이미지 바이트)
+class IrohScreenFrameEvent extends IrohEvent {
+  final int frameSeq;
+  final int width;
+  final int height;
+  final List<int> jpegBytes;
+  final DateTime timestamp;
+
+  IrohScreenFrameEvent({
+    required this.frameSeq,
+    required this.width,
+    required this.height,
+    required this.jpegBytes,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+
+  @override
+  String toString() =>
+      'IrohScreenFrameEvent(frame: #$frameSeq, resolution: ${width}x$height, size: ${jpegBytes.length} bytes)';
+}
+
 /// 에러 이벤트
 class IrohErrorEvent extends IrohEvent {
   final String error;
@@ -217,8 +238,14 @@ abstract class IrohP2PClient {
   Future<void> connect({int? channel, String? ticket});
   Future<void> sendMessage(String message);
   Future<void> sendFile(String filePath);
+  Future<void> startScreenShare({int fps = 30, int quality = 75});
+  Future<void> sendMouseMove(double normalizedX, double normalizedY);
+  Future<void> sendMouseClick({bool isRight = false});
+  Future<void> sendMouseWheel(int delta);
+  Future<void> sendKey(int keyCode, bool isDown);
+  Future<void> sendText(String text);
   Future<void> ping({int count = 20});
-  Future<void> bench({int megabytes = 5});
+  Future<void> bench({int megabytes = 10});
   Future<void> disconnect();
 }
 
@@ -294,32 +321,43 @@ class IrohP2PController implements IrohP2PClient {
   }
 
   @override
-  Future<void> bench({int megabytes = 5}) async {
-    final clampedMb = megabytes.clamp(1, 50);
-    final totalBytes = clampedMb * 1024 * 1024;
-    final chunkSize = 64 * 1024; // 64KB
-    final numChunks = totalBytes ~/ chunkSize;
-    final chunkPayload = 'X' * chunkSize;
+  Future<void> startScreenShare({int fps = 30, int quality = 75}) async {
+    final clampedFps = fps.clamp(5, 60);
+    final clampedQuality = quality.clamp(30, 95);
+    await _sendRaw('/share $clampedFps $clampedQuality');
+  }
 
-    await _sendRaw('__BENCH_START__:$totalBytes');
-    final startTime = DateTime.now();
+  @override
+  Future<void> sendMouseMove(double normalizedX, double normalizedY) async {
+    final x = normalizedX.clamp(0.0, 1.0);
+    final y = normalizedY.clamp(0.0, 1.0);
+    await _sendRaw('/mouse ${x.toStringAsFixed(4)} ${y.toStringAsFixed(4)}');
+  }
 
-    for (int i = 0; i < numChunks; i++) {
-      await _sendRaw('__BENCH_CHUNK__:$chunkPayload');
-    }
+  @override
+  Future<void> sendMouseClick({bool isRight = false}) async {
+    await _sendRaw('/click ${isRight ? "R" : "L"}');
+  }
 
-    await _sendRaw('__BENCH_END__:done');
-    final elapsedSec =
-        DateTime.now().difference(startTime).inMicroseconds / 1000000.0;
-    final speedMbs = clampedMb / (elapsedSec > 0 ? elapsedSec : 0.001);
+  @override
+  Future<void> sendMouseWheel(int delta) async {
+    await _sendRaw('__CTRL__:MW:$delta');
+  }
 
-    final report = IrohBenchReportEvent(
-      megabytes: clampedMb.toDouble(),
-      seconds: elapsedSec,
-      speedMbs: speedMbs,
-      isSender: true,
-    );
-    _eventController.add(report);
+  @override
+  Future<void> sendKey(int keyCode, bool isDown) async {
+    await _sendRaw('__CTRL__:${isDown ? "KD" : "KU"}:$keyCode');
+  }
+
+  @override
+  Future<void> sendText(String text) async {
+    await _sendRaw('__CTRL__:TX:$text');
+  }
+
+  @override
+  Future<void> bench({int megabytes = 10}) async {
+    final clampedMb = megabytes.clamp(1, 200);
+    await _sendRaw('/bench $clampedMb');
   }
 
   @override

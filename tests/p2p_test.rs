@@ -293,3 +293,97 @@ async fn test_p2p_file_streaming_transfer() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_remote_control_event_serialization() {
+    use iroh_p2p_example::remote::{MouseButton, RemoteControlEvent};
+
+    // 마우스 이동
+    let ev1 = RemoteControlEvent::MouseMove { x: 0.25, y: 0.75 };
+    let ser1 = ev1.serialize();
+    assert_eq!(ser1, "MM:0.2500:0.7500");
+    let de1 = RemoteControlEvent::deserialize(&ser1).expect("Failed to deserialize MM");
+    assert_eq!(de1, ev1);
+
+    // 마우스 다운/업
+    let ev2 = RemoteControlEvent::MouseDown { button: MouseButton::Right };
+    let ser2 = ev2.serialize();
+    assert_eq!(ser2, "MD:R");
+    let de2 = RemoteControlEvent::deserialize(&ser2).expect("Failed to deserialize MD");
+    assert_eq!(de2, ev2);
+
+    // 마우스 휠
+    let ev3 = RemoteControlEvent::MouseWheel { delta: -120 };
+    let ser3 = ev3.serialize();
+    assert_eq!(ser3, "MW:-120");
+    let de3 = RemoteControlEvent::deserialize(&ser3).expect("Failed to deserialize MW");
+    assert_eq!(de3, ev3);
+
+    // 키보드 키 다운/업
+    let ev4 = RemoteControlEvent::KeyDown { key_code: 65 };
+    let ser4 = ev4.serialize();
+    assert_eq!(ser4, "KD:65");
+    let de4 = RemoteControlEvent::deserialize(&ser4).expect("Failed to deserialize KD");
+    assert_eq!(de4, ev4);
+
+    // 텍스트 입력
+    let ev5 = RemoteControlEvent::TextInput { text: "Hello P2P!".to_string() };
+    let ser5 = ev5.serialize();
+    assert_eq!(ser5, "TX:Hello P2P!");
+    let de5 = RemoteControlEvent::deserialize(&ser5).expect("Failed to deserialize TX");
+    assert_eq!(de5, ev5);
+}
+
+#[tokio::test]
+async fn test_p2p_screen_frame_streaming() -> Result<()> {
+    use iroh_p2p_example::remote::receive_screen_frame;
+
+    let host_endpoint = create_endpoint(vec![CHAT_ALPN.to_vec()]).await?;
+    let target_addr = host_endpoint.addr();
+
+    // Host: 화면 프레임 스트림 수신
+    let host_handle = tokio::spawn(async move {
+        let incoming = host_endpoint.accept().await.expect("Host accept failed");
+        let conn = incoming.await.expect("Host handshake failed");
+        let (_send, mut recv) = conn.accept_bi().await.expect("Host accept bi failed");
+
+        let mut magic = [0u8; 4];
+        iroh_p2p_example::read_exact_stream(&mut recv, &mut magic).await.expect("Read magic failed");
+        assert_eq!(&magic, b"SCRN");
+
+        let frame = receive_screen_frame(&mut recv).await.expect("Receive frame failed");
+        assert_eq!(frame.frame_seq, 42);
+        assert_eq!(frame.width, 1920);
+        assert_eq!(frame.height, 1080);
+        assert_eq!(frame.jpeg_data, vec![0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0x03]);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        host_endpoint.close().await;
+    });
+
+    // Client: 더미 화면 프레임 송신
+    let client_endpoint = create_endpoint(vec![]).await?;
+    let conn = client_endpoint.connect(target_addr, CHAT_ALPN).await.expect("Client connect failed");
+    let (mut send, _recv) = conn.open_bi().await.expect("Client open bi failed");
+
+    // 1. 매직 헤더
+    send.write_all(b"SCRN").await?;
+
+    // 2. 프레임 헤더: seq 42, width 1920, height 1080, len 7
+    let dummy_jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0x03];
+    let mut frame_hdr = [0u8; 12];
+    frame_hdr[0..4].copy_from_slice(&42u32.to_le_bytes());
+    frame_hdr[4..6].copy_from_slice(&1920u16.to_le_bytes());
+    frame_hdr[6..8].copy_from_slice(&1080u16.to_le_bytes());
+    frame_hdr[8..12].copy_from_slice(&(dummy_jpeg.len() as u32).to_le_bytes());
+
+    send.write_all(&frame_hdr).await?;
+    send.write_all(&dummy_jpeg).await?;
+    send.finish()?;
+
+    host_handle.await.expect("Host failed");
+    client_endpoint.close().await;
+
+    println!("P2P Screen Frame Streaming Test Passed!");
+    Ok(())
+}
