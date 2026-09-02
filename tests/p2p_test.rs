@@ -162,9 +162,58 @@ async fn test_p2p_reconnection_loop() -> Result<()> {
     let mut buf2 = vec![0u8; 1024];
     let n2 = recv2.read(&mut buf2).await.expect("Read failed").unwrap_or(0);
     assert_eq!(String::from_utf8_lossy(&buf2[..n2]), "Ack Round 2");
-    endpoint_c2.close().await; // Client 2 종료!
-
     listener_handle.await.expect("Listener panicked");
     println!("Consecutive reconnections test passed successfully!");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_channel_zero_config_connection() -> Result<()> {
+    use iroh_p2p_example::{create_endpoint_with_secret_key, derive_channel_keys};
+
+    let channel_num = 7u32;
+    let (secret_key, target_addr) = derive_channel_keys(channel_num);
+
+    // 1. Host: 채널 7번의 고정 키로 Endpoint 생성
+    let host_endpoint = create_endpoint_with_secret_key(Some(secret_key), vec![CHAT_ALPN.to_vec()]).await?;
+    let host_id = host_endpoint.id();
+
+    let host_handle = tokio::spawn(async move {
+        let incoming = host_endpoint.accept().await.expect("Host accept failed");
+        let conn = incoming.await.expect("Host handshake failed");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("Host bi stream failed");
+
+        let mut buf = vec![0u8; 1024];
+        let n = recv.read(&mut buf).await.expect("Host read failed").unwrap_or(0);
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), "Ping Channel 7");
+
+        send.write_all(b"Pong Channel 7").await.expect("Host write failed");
+        send.finish().expect("Host finish failed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        host_endpoint.close().await;
+    });
+
+    // 2. Client: 티켓 없이 오직 channel 7의 target_addr로 바로 연결
+    let client_endpoint = create_endpoint(vec![]).await?;
+    let conn = client_endpoint
+        .connect(target_addr, CHAT_ALPN)
+        .await
+        .expect("Client channel connect failed");
+
+    assert_eq!(conn.remote_id(), host_id);
+
+    let (mut send, mut recv) = conn.open_bi().await.expect("Client bi stream failed");
+    send.write_all(b"Ping Channel 7").await.expect("Client send failed");
+    send.finish().expect("Client finish failed");
+
+    let mut buf = vec![0u8; 1024];
+    let n = recv.read(&mut buf).await.expect("Client recv failed").unwrap_or(0);
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "Pong Channel 7");
+
+    client_endpoint.close().await;
+    host_handle.await.expect("Host panicked");
+
+    println!("Zero-config channel #7 test passed successfully!");
     Ok(())
 }

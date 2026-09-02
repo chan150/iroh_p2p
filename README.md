@@ -32,58 +32,58 @@
 
 ---
 
-## 🚀 실행 방법
+## 🚀 초간단 실행 방법 (티켓 필요 없는 채널 모드)
 
-두 개의 터미널(또는 서로 다른 두 대의 PC)에서 각각 실행합니다.
+긴 티켓을 복사/붙여넣기할 필요 없이, **채널 번호(`0`, `1`, `2`, `3`...)** 만으로 즉시 연결할 수 있습니다!
 
 ### 1. 호스트(수신 대기) 실행
 ```bash
+# 기본 채널 0번으로 대기
 cargo run -- listen
-```
-실행하면 화면에 아래와 같이 **연결 티켓**이 출력되고 대기 상태가 됩니다.
-```text
-============================================================
- [Iroh P2P Host / Listener]
- Endpoint를 초기화하고 Relay 서버 및 NAT 주소를 탐색 중입니다...
-============================================================
 
- 나의 Endpoint ID: 70de4cd5dee89c9ee71dc127d2f0eb971832ce56828eea5fb468c10f2fc02f5c
- 탐지된 로컬/공인 IP 목록: {Ip(106.251.88.140:59653), ...}
-
-------------------------------------------------------------
- 아래의 [연결 티켓]을 복사해서 상대방에게 전달하세요:
-
-eyJpZCI6IjcwZGU0Y2Q1ZGVlODljOWVlNzFkYzEyN2QyZjBlYjk3MTgzMmNlNTY4MjhlZWE1ZmI0NjhjMTBmMmZjMDJmNWMiLCJhZGRycyI6W...
-------------------------------------------------------------
-
- 상대방의 연결을 대기하고 있습니다... (Ctrl+C 로 취소)
+# 또는 특정 채널 번호(예: 1번)로 대기
+cargo run -- listen 1
 ```
 
-### 2. 클라이언트(연결) 실행
-다른 터미널(또는 다른 PC)에서 위에서 생성된 티켓을 인자로 전달하여 실행합니다:
+### 2. 클라이언트(접속) 실행
 ```bash
-cargo run -- connect <위에서_복사한_티켓>
-```
-*(티켓 없이 `cargo run -- connect` 만 실행하면 콘솔에서 티켓을 직접 입력받습니다.)*
+# 기본 채널 0번으로 즉시 자동 접속 (티켓 필요 없음!)
+cargo run -- connect
 
-### 3. 실시간 대화 및 데이터 교환
-연결이 수립되면 양쪽 터미널에서 메시지를 입력(Enter)하여 실시간 양방향 통신을 할 수 있습니다.
-종료 시에는 `/quit` 또는 `Ctrl+C`를 누릅니다.
+# 또는 특정 채널 번호(예: 1번)로 자동 접속
+cargo run -- connect 1
+```
+*(기존처럼 `connect <티켓문자열>` 형태로 수동 티켓 접속도 100% 호환됩니다.)*
+
+---
+
+## ⚡ 실시간 성능 측정 및 진단 명령어
+
+통신 중 터미널에 아래 명령어를 입력하여 네트워크 품질을 즉시 측정할 수 있습니다:
+
+* **`/ping`**: 5회 왕복 지연시간(RTT / Latency)을 비차단으로 측정하고 최소/최대/평균 지연시간 출력
+* **`/bench [MB]`**: 지정한 크기(예: `/bench 10`, `/bench 50`)의 데이터를 고속 전송하여 **실제 전송 대역폭(`MB/s`, `Mbps`)** 실측
+* **`/stats`**: 현재 QUIC 연결 상태, 송수신 바이트/패킷 수, 패킷 손실 수 출력
+* **`/help`**: 명령어 목록 안내
+* **`/quit`**: 연결 종료
 
 ---
 
 ## 🧪 자동화 통합 테스트 실행
 
-두 엔드포인트 간의 P2P 수립 및 양방향 메시지 송수신을 검증하는 테스트입니다:
-
 ```bash
-cargo test --test p2p_test -- --nocapture
+cargo test -- --nocapture
 ```
+* `test_channel_zero_config_connection`: 티켓 없는 채널 기반 자동 P2P 연결 검증
+* `test_p2p_direct_or_relay_communication`: E2E P2P 데이터 통신 검증
+* `test_p2p_reconnection_loop`: 다중 세션 및 연속 재접속 검증
+* `test_ticket_multiline_and_legacy_decoding`: 멀티라인 티켓 정제 및 디코딩 검증
 
 ---
 
 ## 📂 프로젝트 구조
 
-- `src/lib.rs`: Iroh 엔드포인트 생성 (`create_endpoint`), 티켓 인코딩/디코딩 (`encode_ticket`, `decode_ticket`), 프로토콜 상수(`CHAT_ALPN`) 정의
-- `src/main.rs`: CLI 인터페이스 (`listen`, `connect`) 및 실시간 비동기 양방향 텍스트 스트리밍 루프
-- `tests/p2p_test.rs`: 두 노드를 생성하여 자동으로 연결 및 양방향 데이터 교환을 검증하는 E2E 통합 테스트
+- `src/lib.rs`: 결정론적 채널 키 생성 (`derive_channel_keys`), 엔드포인트 생성 (`create_endpoint_with_secret_key`), 티켓 인코딩/디코딩, 네트워크 통계 포맷팅
+- `src/main.rs`: 채널 기반 Zero-Config CLI 및 실시간 비동기 P2P 채팅 & 대역폭/지연시간 벤치마크 루프
+- `tests/p2p_test.rs`: 무인 자동화 E2E 통합 테스트
+

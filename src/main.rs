@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use iroh_p2p_example::{
-    create_endpoint, decode_ticket, encode_ticket, format_path_info, format_stats_info, CHAT_ALPN,
+    create_endpoint, create_endpoint_with_secret_key, decode_ticket, derive_channel_keys,
+    encode_ticket, format_path_info, format_stats_info, CHAT_ALPN,
 };
 use tokio::io::AsyncBufReadExt;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
@@ -18,12 +19,17 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// P2P 연결 수신 대기 (Host 모드)
-    Listen,
-    /// 티켓을 사용해 원격 피어에 연결 (Client 모드)
+    /// P2P 연결 수신 대기 (Host 모드, 채널 번호 기본값: 0)
+    Listen {
+        /// 고정 채널 번호 (예: 0, 1, 2, 3...)
+        #[arg(default_value = "0")]
+        channel: u32,
+    },
+    /// 원격 피어에 연결 (Client 모드, 채널 번호 또는 티켓 입력)
     Connect {
-        /// 상대방이 발급한 연결 티켓 (또는 생략 시 콘솔에서 입력)
-        ticket: Option<String>,
+        /// 접속할 채널 번호(예: 0, 1, 2) 또는 상대방의 연결 티켓 (생략 시 기본 채널 0)
+        #[arg(default_value = "0")]
+        target: String,
     },
 }
 
@@ -40,22 +46,24 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Listen => run_listener().await?,
-        Commands::Connect { ticket } => run_connector(ticket).await?,
+        Commands::Listen { channel } => run_listener(channel).await?,
+        Commands::Connect { target } => run_connector(target).await?,
     }
 
     Ok(())
 }
 
 /// [수신 대기 모드]
-/// Iroh Endpoint를 생성하고, Relay 및 NAT 주소를 등록한 후 수신 대기
-async fn run_listener() -> Result<()> {
+/// 채널 번호(0, 1, 2...) 기반 고정 키로 Endpoint를 생성하여 수신 대기
+async fn run_listener(channel: u32) -> Result<()> {
+    let (secret_key, _) = derive_channel_keys(channel);
+
     println!("============================================================");
-    println!(" [Iroh P2P Host / Listener]");
+    println!(" [Iroh P2P Host / Listener] - 채널 #{}", channel);
     println!(" Endpoint를 초기화하고 Relay 서버 및 NAT 주소를 탐색 중입니다...");
     println!("============================================================");
 
-    let endpoint = create_endpoint(vec![CHAT_ALPN.to_vec()]).await?;
+    let endpoint = create_endpoint_with_secret_key(Some(secret_key), vec![CHAT_ALPN.to_vec()]).await?;
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -65,13 +73,14 @@ async fn run_listener() -> Result<()> {
     // 편의를 위해 ticket.txt 파일로도 저장
     let _ = std::fs::write("ticket.txt", &ticket);
 
-    println!("\n 나의 Endpoint ID: {}", endpoint.id());
-    println!(" 탐지된 로컬/공인 IP 목록: {:?}", my_addr.addrs);
-    println!("\n------------------------------------------------------------");
-    println!(" 아래의 [연결 티켓]을 복사해서 상대방에게 전달하세요:");
-    println!(" (현재 디렉터리의 ticket.txt 파일에도 저장되었습니다)");
-    println!("\n{}", ticket);
+    println!("\n 나의 Endpoint ID : {}", endpoint.id());
+    println!(" 탐지된 IP 목록   : {:?}", my_addr.addrs);
     println!("------------------------------------------------------------");
+    println!(" 🔒 [채널 모드 활성화]");
+    println!(" 상대방은 티켓 입력 없이 아래 명령어만 치면 즉시 연결됩니다:");
+    println!(" 👉 .\\iroh-p2p-example.exe connect {}", channel);
+    println!("------------------------------------------------------------");
+    println!(" (참고용 전체 티켓은 ticket.txt 파일에 저장되었습니다)");
     println!("\n 상대방의 연결을 대기하고 있습니다... (Ctrl+C 로 취소)");
 
     // 2. 상대방의 연결을 계속 수신 대기하는 루프
@@ -107,7 +116,7 @@ async fn run_listener() -> Result<()> {
 
         println!("\n============================================================");
         println!(" [대기 중] 클라이언트 세션이 종료되었습니다.");
-        println!(" 동일한 티켓으로 새로운 연결을 계속 대기합니다... (Ctrl+C 로 종료)");
+        println!(" 채널 #{} 번으로 새로운 연결을 계속 대기합니다... (Ctrl+C 로 종료)", channel);
         println!("============================================================\n");
     }
 
@@ -116,23 +125,22 @@ async fn run_listener() -> Result<()> {
 }
 
 /// [연결 모드]
-/// 상대방의 티켓을 디코딩하여 Direct P2P / Relay를 통해 연결
-async fn run_connector(ticket_arg: Option<String>) -> Result<()> {
-    let ticket_str = match ticket_arg {
-        Some(t) => t,
-        None => {
-            print!("상대방의 연결 티켓(또는 ticket.txt 경로)을 입력하세요: ");
-            io::stdout().flush()?;
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            input.trim().to_string()
-        }
+/// 채널 번호(예: 0, 1, 2) 또는 티켓 문자열을 통해 대상 피어에 연결
+async fn run_connector(target_input: String) -> Result<()> {
+    let trimmed = target_input.trim();
+
+    // 1. 숫자인 경우 (채널 번호 모드 -> 티켓 입력 필요 없음!)
+    let (remote_addr, mode_label) = if let Ok(channel) = trimmed.parse::<u32>() {
+        let (_, target_addr) = derive_channel_keys(channel);
+        (target_addr, format!("채널 #{} 자동 접속 모드", channel))
+    } else {
+        // 2. 문자열/티켓 파일 경로인 경우 (티켓 디코딩 모드)
+        let target_addr = decode_ticket(trimmed)?;
+        (target_addr, "티켓 수동 접속 모드".to_string())
     };
 
-    let remote_addr = decode_ticket(&ticket_str)?;
-
     println!("============================================================");
-    println!(" [Iroh P2P Connector]");
+    println!(" [Iroh P2P Connector] - {}", mode_label);
     println!(" 대상 Node ID: {}", remote_addr.id);
     println!(" Endpoint를 초기화하고 P2P / Relay 연결을 시도합니다...");
     println!("============================================================");

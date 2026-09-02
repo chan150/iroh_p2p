@@ -42,26 +42,57 @@ pub fn decode_ticket(input: &str) -> Result<EndpointAddr> {
     anyhow::bail!("지원하지 않거나 손상된 티켓 형식입니다.")
 }
 
+/// 채널 번호(0, 1, 2, 3...)로부터 호스트의 고정 SecretKey와 접속용 EndpointAddr를 결정론적으로 생성합니다.
+pub fn derive_channel_keys(channel: u32) -> (iroh::SecretKey, EndpointAddr) {
+    let salt = b"iroh-private-p2p-channel-salt-2026-auth";
+    let mut seed = [0u8; 32];
+    for (i, byte) in salt.iter().enumerate() {
+        seed[i % 32] ^= byte;
+    }
+    let ch_bytes = channel.to_le_bytes();
+    for (i, byte) in ch_bytes.iter().enumerate() {
+        seed[i] ^= byte;
+    }
+    for i in 0..32 {
+        seed[i] = seed[i].wrapping_add((i as u8).wrapping_mul(7));
+    }
+
+    let secret_key = iroh::SecretKey::from_bytes(&seed);
+    let public_key = secret_key.public();
+    let relay_url: iroh::RelayUrl = "https://aps1-1.relay.n0.iroh.link./".parse().unwrap();
+    let target_addr = EndpointAddr::new(public_key).with_relay_url(relay_url);
+
+    (secret_key, target_addr)
+}
+
 /// Iroh Endpoint를 생성합니다.
-/// n0 글로벌 Relay 서버(DERP)를 기본 활성화하되,
-/// 불필요한 백그라운드 Pkarr/DNS 게시 시도(dns.iroh.link)를 방지하기 위해 presets::Minimal + RelayMode::Default를 사용합니다.
-pub async fn create_endpoint(alpns: Vec<Vec<u8>>) -> Result<Endpoint> {
-    // 로컬 공유기/사설 DNS 서버의 쿼리 거부(Query refused) 문제를 방지하기 위해
-    // 신뢰할 수 있는 공용 DNS(1.1.1.1:53)를 기본 네임서버로 설정
+/// secret_key를 지정하면 고정 Node ID를 사용하며, None이면 임의의 새 키를 생성합니다.
+pub async fn create_endpoint_with_secret_key(
+    secret_key: Option<iroh::SecretKey>,
+    alpns: Vec<Vec<u8>>,
+) -> Result<Endpoint> {
     let dns_resolver = iroh::dns::DnsResolver::with_nameserver("1.1.1.1:53".parse().unwrap());
 
-    let endpoint = Endpoint::builder(presets::Minimal)
+    let mut builder = Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Default)
         .dns_resolver(dns_resolver)
-        .alpns(alpns)
-        .bind()
-        .await
-        .context("Iroh Endpoint 바인딩 실패")?;
+        .alpns(alpns);
+
+    if let Some(sk) = secret_key {
+        builder = builder.secret_key(sk);
+    }
+
+    let endpoint = builder.bind().await.context("Iroh Endpoint 바인딩 실패")?;
 
     // 릴레이 서버 핸드셰이크 및 공인/사설 네트워크 주소 준비 완료 대기 (최대 5초)
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.online()).await;
 
     Ok(endpoint)
+}
+
+/// Iroh Endpoint를 임의의 키로 생성합니다.
+pub async fn create_endpoint(alpns: Vec<Vec<u8>>) -> Result<Endpoint> {
+    create_endpoint_with_secret_key(None, alpns).await
 }
 
 /// 현재 활성화된 네트워크 경로(Direct P2P vs Relay)를 사람이 읽기 쉬운 문자열로 변환합니다.
