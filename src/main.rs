@@ -346,7 +346,6 @@ async fn handle_chat_session(
     let mut framed_recv = FramedRead::new(recv_stream, LinesCodec::new());
 
     let mut stdin_lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    let mut bench_receive_start: Option<(std::time::Instant, usize)> = None;
     let mut ping_stats: Vec<u128> = Vec::new();
 
     // 백그라운드 스트림 수신 태스크: 파일 전송 및 고속 바이너리 벤치마크 자동 디스패치
